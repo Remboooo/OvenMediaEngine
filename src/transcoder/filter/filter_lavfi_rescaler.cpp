@@ -11,6 +11,7 @@
 
 #include <base/ovlibrary/ovlibrary.h>
 
+#include "../transcoder_gpu.h"
 #include "../transcoder_private.h"
 
 FilterLavfiRescaler::~FilterLavfiRescaler()
@@ -21,52 +22,97 @@ FilterLavfiRescaler::~FilterLavfiRescaler()
 /**
  * Output Module Cases
  * - OPENH264(default), X264, LIBVPX : SW-based module (CPU memory)
+ * - NVENC : CUDA HW-based module (GPU memory)
  *
- * The scaler runs in host memory with the `scale` filter. Input frames that
- * live in device memory are brought down to the host first (NVENC via hwframe
- * transfer, XMA via xvbm_convert).
+ * SW output: scale runs in host memory. HW input frames are downloaded first.
+ * NVENC output: hwupload_cuda + scale_cuda upload and scale on the GPU.
  */
 bool FilterLavfiRescaler::BuildDescription(ov::String &desc)
 {
 	auto input_module_id = _input_track->GetCodecModuleId();
 	auto input_device_id = _input_track->GetCodecDeviceId();
-
-	// SW -> SW
-	// HW -> SW (Download to host memory)
-	switch (input_module_id)
-	{
-		// HW -> SW
-		case cmn::MediaCodecModuleId::NVENC: {
-			// Copy data to host memory for cross-device compatibility.
-			_src_pixfmt = ffmpeg::compat::GetVideoPixelFormatOfHWDevice(input_module_id, input_device_id, true);
-			if (_src_pixfmt == cmn::VideoPixelFormatId::None)
-			{
-				logte("[%s] Failed to get pixel format for %s(%d)", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id), input_device_id);
-				return false;
-			}
-			_use_hwframe_transfer = true;
-			desc.Clear();
-		}
-		break;
-		case cmn::MediaCodecModuleId::XMA: {
-			desc = ov::String::FormatString("xvbm_convert,");
-		}
-		break;
-		case cmn::MediaCodecModuleId::DEFAULT:	// CPU memory
-		{
-			desc.Clear();
-		}
-		break;
-		case cmn::MediaCodecModuleId::NETINT:	
-		default: {
-			logtw("Unsupported input module: %s", cmn::GetCodecModuleIdString(input_module_id));
-			desc.Clear();
-		}
-	}
-
-	// Scaler description of default module
+	auto output_module_id = _output_track->GetCodecModuleId();
+	auto output_device_id = _output_track->GetCodecDeviceId();
 	auto resolution = _output_track->GetResolution();
-	desc += ov::String::FormatString("scale=%dx%d:flags=bilinear", resolution.width, resolution.height);
+
+	if (output_module_id == cmn::MediaCodecModuleId::DEFAULT ||
+		output_module_id == cmn::MediaCodecModuleId::OPENH264 ||
+		output_module_id == cmn::MediaCodecModuleId::X264 ||
+		output_module_id == cmn::MediaCodecModuleId::LIBVPX ||
+		output_module_id == cmn::MediaCodecModuleId::NETINT)
+	{
+		switch (input_module_id)
+		{
+			case cmn::MediaCodecModuleId::NVENC: {
+				_src_pixfmt = ffmpeg::compat::GetVideoPixelFormatOfHWDevice(input_module_id, input_device_id, true);
+				if (_src_pixfmt == cmn::VideoPixelFormatId::None)
+				{
+					logte("[%s] Failed to get pixel format for %s(%d)", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id), input_device_id);
+					return false;
+				}
+				_use_hwframe_transfer = true;
+				desc.Clear();
+			}
+			break;
+			case cmn::MediaCodecModuleId::XMA: {
+				desc = ov::String::FormatString("xvbm_convert,");
+			}
+			break;
+			case cmn::MediaCodecModuleId::DEFAULT:
+				desc.Clear();
+				break;
+			default:
+				logtw("[%s] Unsupported input module: %s", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id));
+				desc.Clear();
+				break;
+		}
+
+		desc += ov::String::FormatString("scale=%dx%d:flags=bilinear", resolution.width, resolution.height);
+	}
+	else if (output_module_id == cmn::MediaCodecModuleId::NVENC)
+	{
+		int32_t cuda_id = TranscodeGPU::GetInstance()->GetExternalDeviceId(cmn::MediaCodecModuleId::NVENC, output_device_id);
+
+		switch (input_module_id)
+		{
+			case cmn::MediaCodecModuleId::NVENC: {
+				if (input_device_id != output_device_id)
+				{
+					_src_pixfmt = ffmpeg::compat::GetVideoPixelFormatOfHWDevice(input_module_id, input_device_id, true);
+					if (_src_pixfmt == cmn::VideoPixelFormatId::None)
+					{
+						logte("[%s] Failed to get pixel format for %s(%d)", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id), input_device_id);
+						return false;
+					}
+					_use_hwframe_transfer = true;
+					desc = ov::String::FormatString("hwupload_cuda=device=%d,", cuda_id);
+				}
+				else
+				{
+					desc.Clear();
+				}
+			}
+			break;
+			case cmn::MediaCodecModuleId::XMA: {
+				desc = ov::String::FormatString("xvbm_convert,hwupload_cuda=device=%d,", cuda_id);
+			}
+			break;
+			default:
+				logtw("[%s] Unsupported input module: %s", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id));
+			case cmn::MediaCodecModuleId::X264:
+			case cmn::MediaCodecModuleId::DEFAULT: {
+				desc = ov::String::FormatString("hwupload_cuda=device=%d,", cuda_id);
+			}
+			break;
+		}
+
+		desc += ov::String::FormatString("scale_cuda=%d:%d:format=nv12", resolution.width, resolution.height);
+	}
+	else
+	{
+		logtw("[%s] Unsupported output module: %s", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(output_module_id));
+		return false;
+	}
 
 	return true;
 }
@@ -127,7 +173,10 @@ bool FilterLavfiRescaler::InitializeFilterDescription()
 		filters.push_back(desc);
 
 		// 4. Pixel Format
-		filters.push_back(ov::String::FormatString("format=%s", ffmpeg::compat::GetAVPixelFormatName(ffmpeg::compat::ToAVPixelFormat(_output_track->GetColorspace())).CStr()));
+		if (_output_track->GetCodecModuleId() != cmn::MediaCodecModuleId::NVENC)
+		{
+			filters.push_back(ov::String::FormatString("format=%s", ffmpeg::compat::GetAVPixelFormatName(ffmpeg::compat::ToAVPixelFormat(_output_track->GetColorspace())).CStr()));
+		}
 	}
 
 	if (filters.size() == 0)
@@ -215,6 +264,19 @@ bool FilterLavfiRescaler::Initialize()
 		SetState(State::ERROR);
 
 		return false;
+	}
+
+	if (_output_track->GetCodecModuleId() == cmn::MediaCodecModuleId::NVENC)
+	{
+		auto hw_device_ctx = TranscodeGPU::GetInstance()->GetDeviceContext(cmn::MediaCodecModuleId::NVENC, _output_track->GetCodecDeviceId());
+		auto out_resolution = _output_track->GetResolution();
+		if (_graph.ApplyCudaHwContext(hw_device_ctx, out_resolution.width, out_resolution.height) == false)
+		{
+			logte("[%s] Could not apply CUDA hw context to filter graph", GetLogPrefix().CStr());
+			SetState(State::ERROR);
+
+			return false;
+		}
 	}
 
 	SetState(State::STARTED);

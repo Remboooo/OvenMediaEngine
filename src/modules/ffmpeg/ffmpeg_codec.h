@@ -20,6 +20,7 @@ extern "C"
 {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/mem.h>
 #include <libavutil/opt.h>
 }
@@ -161,6 +162,7 @@ namespace ffmpeg
 
 		AVFrame *_receive_frame = nullptr;	 // Reused output frame used by ReceiveFrame().
 		AVPacket *_receive_packet = nullptr; // Reused output packet used by ReceivePacket().
+		AVFrame *_hw_transfer_frame = nullptr; // Reused frame for cross-pool CUDA uploads to encoders.
 		int _last_error = 0;
 	};
 }

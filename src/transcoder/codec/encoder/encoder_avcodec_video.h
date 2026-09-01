@@ -11,8 +11,9 @@
 #include "../../transcoder_encoder.h"
 #include <modules/ffmpeg/ffmpeg_codec.h>
 
-// AVCodecVideoEncoder handles the software FFmpeg video encoders:
-//   - H.264 : libx264 (X264) / libopenh264 (OPENH264, DEFAULT)
+// AVCodecVideoEncoder handles FFmpeg video encoders:
+//   - H.264 : libx264 (X264) / libopenh264 (OPENH264, DEFAULT) / h264_nvenc (NVENC)
+//   - H.265 : hevc_nvenc (NVENC)
 //   - VP8   : libvpx (LIBVPX)
 //   - AV1   : libaom (libaom-av1)
 class AVCodecVideoEncoder : public TranscodeEncoder
@@ -29,11 +30,14 @@ public:
 	cmn::MediaCodecId GetCodecID() const noexcept override { return _codec_id; }
 	cmn::MediaCodecModuleId GetModuleID() const noexcept override { return _module_id; }
 	cmn::MediaType GetMediaType() const noexcept override { return cmn::MediaType::Video; }
-	bool IsHWAccel() const noexcept override { return false; }
+	bool IsHWAccel() const noexcept override { return _module_id == cmn::MediaCodecModuleId::NVENC; }
 
 	// ----- Supported formats -----
 	cmn::AudioSample::Format GetSupportAudioFormat() const noexcept override { return cmn::AudioSample::Format::None; }
-	cmn::VideoPixelFormatId GetSupportVideoFormat() const noexcept override { return cmn::VideoPixelFormatId::YUV420P; }
+	cmn::VideoPixelFormatId GetSupportVideoFormat() const noexcept override
+	{
+		return (_module_id == cmn::MediaCodecModuleId::NVENC) ? cmn::VideoPixelFormatId::CUDA : cmn::VideoPixelFormatId::YUV420P;
+	}
 	cmn::BitstreamFormat GetBitstreamFormat() const noexcept override
 	{
 		switch (_codec_id)
@@ -63,6 +67,7 @@ private:
 	bool OpenCodec();
 	bool SetParamsX264();
 	bool SetParamsOpenH264();
+	bool SetParamsNvenc();
 	bool SetParamsVp8();
 	bool SetParamsLibAOM();
 

@@ -17,6 +17,7 @@ namespace ffmpeg
 		OV_SAFE_FUNC(_send_packet, nullptr, ::av_packet_free, &);
 		OV_SAFE_FUNC(_receive_frame, nullptr, ::av_frame_free, &);
 		OV_SAFE_FUNC(_receive_packet, nullptr, ::av_packet_free, &);
+		OV_SAFE_FUNC(_hw_transfer_frame, nullptr, ::av_frame_free, &);
 	}
 
 	bool FFmpegCodec::AllocDecoder(cmn::MediaCodecId codec_id)
@@ -148,13 +149,46 @@ namespace ffmpeg
 			return CodecResult::NoMemory;
 		}
 
+		AVFrame *send_frame = frame;
+		if (_context->hw_frames_ctx != nullptr &&
+			frame->hw_frames_ctx != nullptr &&
+			frame->hw_frames_ctx != _context->hw_frames_ctx)
+		{
+			if (_hw_transfer_frame == nullptr)
+			{
+				_hw_transfer_frame = ::av_frame_alloc();
+				if (_hw_transfer_frame == nullptr)
+				{
+					return CodecResult::NoMemory;
+				}
+			}
+
+			::av_frame_unref(_hw_transfer_frame);
+
+			if (::av_hwframe_get_buffer(_context->hw_frames_ctx, _hw_transfer_frame, 0) < 0)
+			{
+				return CodecResult::NoMemory;
+			}
+
+			if (::av_hwframe_transfer_data(_hw_transfer_frame, frame, 0) < 0)
+			{
+				return CodecResult::InvalidData;
+			}
+
+			_hw_transfer_frame->pts = frame->pts;
+			_hw_transfer_frame->pkt_dts = frame->pkt_dts;
+			_hw_transfer_frame->duration = frame->duration;
+			_hw_transfer_frame->pict_type = frame->pict_type;
+			send_frame = _hw_transfer_frame;
+		}
+
 		// Apply the force-keyframe decision made (FFmpeg-free) by the base loop.
 		if (media_type == cmn::MediaType::Video)
 		{
-			frame->pict_type = force_keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+			send_frame->pict_type = force_keyframe ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
 		}
 
-		return ToCodecResult(::avcodec_send_frame(_context, frame));
+		return ToCodecResult(::avcodec_send_frame(_context, send_frame));
 	}
 
 	ReceivePacketResult FFmpegCodec::ReceivePacket(cmn::BitstreamFormat bitstream_format, cmn::PacketType packet_type)
@@ -282,7 +316,7 @@ namespace ffmpeg
 		frames_ctx->sw_format	   = *(constraints->valid_sw_formats);
 		frames_ctx->width		   = _context->width;
 		frames_ctx->height		   = _context->height;
-		frames_ctx->initial_pool_size = 2;
+		frames_ctx->initial_pool_size = 8;
 
 		::av_hwframe_constraints_free(&constraints);
 

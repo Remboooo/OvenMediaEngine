@@ -217,6 +217,10 @@ namespace ffmpeg
 			return CodecResult::InvalidData;
 		}
 
+		src_frame->pts = media_frame->GetPts();
+		src_frame->pkt_dts = media_frame->GetPts();
+		src_frame->duration = media_frame->GetDuration();
+
 		CodecResult result = ToCodecResult(::av_buffersrc_write_frame(_buffersrc_ctx, src_frame));
 
 		if (local_frame != nullptr)
@@ -368,7 +372,7 @@ namespace ffmpeg
 		frames_ctx->sw_format	   = *(constraints->valid_sw_formats);
 		frames_ctx->width		   = width;
 		frames_ctx->height		   = height;
-		frames_ctx->initial_pool_size = 2;
+		frames_ctx->initial_pool_size = 8;
 
 		::av_hwframe_constraints_free(&constraints);
 
