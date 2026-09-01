@@ -323,10 +323,31 @@ bool TranscodeGPU::CheckSupportedNV()
 		}
 
 		// Create CUDA device context
-		_device_context_nv[device_id] = ffmpeg::FFmpegHwDeviceContext::Create(cmn::MediaCodecModuleId::NVENC, ov::String::FormatString("%d", matched_cu_index));
+		// Retried a few times as cheap defense against a brief transient failure
+		// (e.g. a momentary host memory spike). Confirmed via direct repro that
+		// the underlying failure mode is av_hwdevice_ctx_create() returning
+		// ENOMEM -- a real host allocation failure, not a GPU/driver timing
+		// issue -- so this retry alone will NOT recover from sustained memory
+		// pressure; the actual fix for that is freeing host memory headroom
+		// (see ops notes: ZFS ARC sizing).
+		constexpr int kCudaContextCreateRetries = 5;
+		constexpr int kCudaContextCreateRetryDelayUs = 200 * 1000;  // 200ms
+
+		for (int attempt = 0; attempt < kCudaContextCreateRetries; attempt++)
+		{
+			_device_context_nv[device_id] = ffmpeg::FFmpegHwDeviceContext::Create(cmn::MediaCodecModuleId::NVENC, ov::String::FormatString("%d", matched_cu_index));
+			if (_device_context_nv[device_id] != nullptr)
+			{
+				break;
+			}
+
+			logtd("Failed to create CUDA device context for device %d (CUDA index %d), attempt %d/%d", device_id, matched_cu_index, attempt + 1, kCudaContextCreateRetries);
+			usleep(kCudaContextCreateRetryDelayUs);
+		}
+
 		if (_device_context_nv[device_id] == nullptr)
 		{
-			logtw("Failed to create CUDA device context for device %d (CUDA index %d)", device_id, matched_cu_index);
+			logtw("Failed to create CUDA device context for device %d (CUDA index %d) after %d attempts", device_id, matched_cu_index, kCudaContextCreateRetries);
 			continue;
 		}
 

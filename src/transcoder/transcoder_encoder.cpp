@@ -166,6 +166,7 @@ std::shared_ptr<TranscodeEncoder> TranscodeEncoder::Instantiate(
 			case cmn::MediaCodecModuleId::DEFAULT:
 			case cmn::MediaCodecModuleId::OPENH264: return std::make_shared<AVCodecVideoEncoder>(stream_info, codec_id, cmn::MediaCodecModuleId::OPENH264);
 			case cmn::MediaCodecModuleId::X264:     return std::make_shared<AVCodecVideoEncoder>(stream_info, codec_id, cmn::MediaCodecModuleId::X264);
+			case cmn::MediaCodecModuleId::NVENC:    return std::make_shared<AVCodecVideoEncoder>(stream_info, codec_id, cmn::MediaCodecModuleId::NVENC);
 			default: break;
 		}
 	}
@@ -173,6 +174,7 @@ std::shared_ptr<TranscodeEncoder> TranscodeEncoder::Instantiate(
 	{
 		switch (module_id)
 		{
+			case cmn::MediaCodecModuleId::NVENC: return std::make_shared<AVCodecVideoEncoder>(stream_info, codec_id, cmn::MediaCodecModuleId::NVENC);
 			default: break;
 		}
 	}

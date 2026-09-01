@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <thread>
 
+#include "../../transcoder_gpu.h"
 #include "../../transcoder_private.h"
 
 
@@ -393,6 +394,128 @@ bool AVCodecVideoEncoder::SetParamsLibAOM()
 	return true;
 }
 
+// ---------------------------------------------------------------------------
+// NVENC (h264_nvenc / hevc_nvenc)
+// ---------------------------------------------------------------------------
+bool AVCodecVideoEncoder::SetParamsNvenc()
+{
+	_codec.SetBitrate(GetRefTrack()->GetBitrate());
+	_codec.SetRcMinRate(_codec.GetBitrate());
+	_codec.SetRcMaxRate(_codec.GetBitrate());
+	_codec.SetRcBufferSize(static_cast<int>(_codec.GetBitrate() / 2));
+	_codec.SetFrameRate(cmn::Rational::FromDouble(GetRefTrack()->GetFrameRate()));
+	_codec.SetSampleAspectRatio(cmn::Rational(1, 1));
+	_codec.SetTicksPerFrame(2);
+	_codec.SetTimeBase(GetRefTrack()->GetTimeBase());
+	_codec.SetPixelFormat(GetSupportVideoFormat());
+	auto resolution = GetRefTrack()->GetResolution();
+	_codec.SetWidth(resolution.width);
+	_codec.SetHeight(resolution.height);
+
+	if (_codec_id == cmn::MediaCodecId::H265)
+	{
+		_codec.SetMaxBFrames(0);
+	}
+	else
+	{
+		// NVENC live pipelines must not use B-frames; reordering breaks LLHLS/WebRTC timing.
+		if (GetRefTrack()->GetBFrames() > 0)
+		{
+			logti("NVENC encoder ignores BFrames(%d); using 0 for live output", GetRefTrack()->GetBFrames());
+		}
+		_codec.SetMaxBFrames(0);
+	}
+
+	_codec.SetLowDelay();
+	_codec.SetOption("bf", "0");
+	_codec.SetOption("delay", "0");
+	_codec.SetOption("zerolatency", "1");
+	_codec.SetOption("rc-lookahead", static_cast<int64_t>(0));
+
+	auto key_frame_interval_type = GetRefTrack()->GetKeyFrameIntervalTypeByConfig();
+	if (key_frame_interval_type == cmn::KeyFrameIntervalType::TIME)
+	{
+		_codec.SetGopSize((int32_t)(GetRefTrack()->GetFrameRate() * (double)GetRefTrack()->GetKeyFrameInterval() / 1000 * 2));
+		_codec.SetOption("forced-idr", "1");
+	}
+	else if (key_frame_interval_type == cmn::KeyFrameIntervalType::FRAME)
+	{
+		_codec.SetGopSize((GetRefTrack()->GetKeyFrameInterval() == 0) ? (int32_t)_codec.GetFrameRate().GetExpr() : GetRefTrack()->GetKeyFrameInterval());
+	}
+
+	if (GetRefTrack()->GetLookaheadByConfig() >= 0)
+	{
+		logtt("NVENC encoder ignores lookahead(%d) for low-latency output", GetRefTrack()->GetLookaheadByConfig());
+	}
+
+	auto profile = GetRefTrack()->GetProfile();
+	if (_codec_id == cmn::MediaCodecId::H264)
+	{
+		if (profile.IsEmpty() == true)
+		{
+			_codec.SetOption("profile", "baseline");
+		}
+		else if (profile == "baseline")
+		{
+			_codec.SetOption("profile", "baseline");
+		}
+		else if (profile == "main")
+		{
+			_codec.SetOption("profile", "main");
+		}
+		else if (profile == "high")
+		{
+			_codec.SetOption("profile", "high");
+		}
+		else
+		{
+			logtw("This is an unknown profile. change to the default(baseline) profile.");
+			_codec.SetOption("profile", "baseline");
+		}
+	}
+
+	auto preset = GetRefTrack()->GetPreset();
+	if (preset == "slower")
+	{
+		_codec.SetOption("preset", "p7");
+	}
+	else if (preset == "slow")
+	{
+		_codec.SetOption("preset", "p6");
+	}
+	else if (preset == "medium")
+	{
+		_codec.SetOption("preset", "p5");
+	}
+	else if (preset == "fast")
+	{
+		_codec.SetOption("preset", "p4");
+	}
+	else if (preset == "faster")
+	{
+		_codec.SetOption("preset", "p3");
+	}
+	else
+	{
+		_codec.SetOption("preset", "p7");
+	}
+
+	_codec.SetOption("tune", "ull");
+	_codec.SetOption("rc", "cbr");
+
+	if (_codec_id == cmn::MediaCodecId::H265)
+	{
+		_bitstream_format = cmn::BitstreamFormat::H265_ANNEXB;
+	}
+	else
+	{
+		_bitstream_format = cmn::BitstreamFormat::H264_ANNEXB;
+	}
+	_packet_type = cmn::PacketType::NALU;
+
+	return true;
+}
+
 bool AVCodecVideoEncoder::OpenCodec()
 {
 	bool allocated = false;
@@ -408,6 +531,17 @@ bool AVCodecVideoEncoder::OpenCodec()
 	else if (_module_id == cmn::MediaCodecModuleId::X264)
 	{
 		allocated = _codec.AllocEncoderByName("libx264");
+	}
+	else if (_module_id == cmn::MediaCodecModuleId::NVENC)
+	{
+		if (_codec_id == cmn::MediaCodecId::H265)
+		{
+			allocated = _codec.AllocEncoderByName("hevc_nvenc");
+		}
+		else
+		{
+			allocated = _codec.AllocEncoderByName("h264_nvenc");
+		}
 	}
 	else
 	{
@@ -431,7 +565,11 @@ bool AVCodecVideoEncoder::OpenCodec()
 			result = SetParamsLibAOM();
 			break;
 		default:
-			if (_module_id == cmn::MediaCodecModuleId::X264)
+			if (_module_id == cmn::MediaCodecModuleId::NVENC)
+			{
+				result = SetParamsNvenc();
+			}
+			else if (_module_id == cmn::MediaCodecModuleId::X264)
 			{
 				result = SetParamsX264();
 			}
@@ -446,6 +584,29 @@ bool AVCodecVideoEncoder::OpenCodec()
 	{
 		logte("Could not set codec parameters for %s", cmn::GetCodecIdString(GetCodecID()));
 		return false;
+	}
+
+	if (_module_id == cmn::MediaCodecModuleId::NVENC)
+	{
+		auto hw_device_ctx = TranscodeGPU::GetInstance()->GetDeviceContext(cmn::MediaCodecModuleId::NVENC, GetDeviceID());
+		if (hw_device_ctx == nullptr)
+		{
+			logte("Could not get hw device context for %s", cmn::GetCodecIdString(GetCodecID()));
+			return false;
+		}
+
+		if (_codec.SetHwDeviceContext(hw_device_ctx) == false)
+		{
+			logte("Could not set hw device context for %s", cmn::GetCodecIdString(GetCodecID()));
+			return false;
+		}
+
+		if (_codec.SetHwFramesContext() == false)
+		{
+			logte("Could not set hw frames context for %s", cmn::GetCodecIdString(GetCodecID()));
+			_codec.UnrefHwDeviceContext();
+			return false;
+		}
 	}
 
 	if (_codec.Open() == false)
