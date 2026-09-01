@@ -134,7 +134,36 @@ std::shared_ptr<std::vector<std::shared_ptr<info::CodecCandidate>>> TranscodeDec
 	return candidate_modules;
 }
 
-#define CREATE_DECODER(CLS)                                                       \
+#define CREATE_VIDEO_DECODER(CLS)                                                 \
+	decoder = std::make_shared<CLS>(*info, candidate->GetCodecId(), candidate->GetModuleId()); \
+	if (decoder != nullptr)                                                       \
+	{                                                                             \
+		decoder->SetDeviceID(candidate->GetDeviceId());                           \
+		decoder->SetDecoderId(decoder_id);                                        \
+		decoder->SetCompleteHandler(complete_handler);                            \
+		track->SetCodecModuleId(decoder->GetModuleID());                          \
+		track->SetCodecDeviceId(decoder->GetDeviceID());                          \
+		if (candidate->GetModuleId() == cmn::MediaCodecModuleId::NVENC)         \
+		{                                                                         \
+			track->SetColorspace(cmn::VideoPixelFormatId::CUDA);                  \
+		}                                                                         \
+		if (decoder->Configure(track) == true)                                    \
+		{                                                                         \
+			if (TranscodeFaultInjector::GetInstance()->IsEnabled() == false ||    \
+				TranscodeFaultInjector::GetInstance()->IsTriggered(               \
+					TranscodeFaultInjector::ComponentType::DecoderComponent,      \
+					TranscodeFaultInjector::IssueType::InitFailed,                \
+					decoder->GetModuleID(),                                       \
+					decoder->GetDeviceID()) == false)                             \
+			{                                                                     \
+				goto done;                                                        \
+			}                                                                     \
+		}                                                                         \
+		decoder->Stop();                                                          \
+		decoder = nullptr;                                                        \
+	}
+
+#define CREATE_AUDIO_DECODER(CLS)                                                 \
 	decoder = std::make_shared<CLS>(*info, candidate->GetCodecId());              \
 	if (decoder != nullptr)                                                       \
 	{                                                                             \
@@ -172,13 +201,14 @@ std::shared_ptr<TranscodeDecoder> TranscodeDecoder::Create(
 		switch (candidate->GetModuleId())
 		{
 			case cmn::MediaCodecModuleId::DEFAULT:
+			case cmn::MediaCodecModuleId::NVENC:
 				if (cmn::IsVideoCodec(candidate->GetCodecId()) == true)
 				{
-					CREATE_DECODER(AVCodecVideoDecoder)
+					CREATE_VIDEO_DECODER(AVCodecVideoDecoder)
 				}
 				else
 				{
-					CREATE_DECODER(AVCodecAudioDecoder)
+					CREATE_AUDIO_DECODER(AVCodecAudioDecoder)
 				}
 				break;
 			

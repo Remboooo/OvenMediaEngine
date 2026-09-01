@@ -89,6 +89,12 @@ bool FilterLavfiRescaler::BuildDescription(ov::String &desc)
 				}
 				else
 				{
+					_src_pixfmt = ffmpeg::compat::GetVideoPixelFormatOfHWDevice(input_module_id, input_device_id, false);
+					if (_src_pixfmt == cmn::VideoPixelFormatId::None)
+					{
+						logte("[%s] Failed to get pixel format for %s(%d)", GetLogPrefix().CStr(), cmn::GetCodecModuleIdString(input_module_id), input_device_id);
+						return false;
+					}
 					desc.Clear();
 				}
 			}
@@ -258,25 +264,26 @@ bool FilterLavfiRescaler::Initialize()
 		return false;
 	}
 
-	if (_graph.Config() == false)
-	{
-		logte("[%s] Could not validate filter graph for rescaling: %s", GetLogPrefix().CStr(), _graph.GetLastErrorString().CStr());
-		SetState(State::ERROR);
-
-		return false;
-	}
-
 	if (_output_track->GetCodecModuleId() == cmn::MediaCodecModuleId::NVENC)
 	{
 		auto hw_device_ctx = TranscodeGPU::GetInstance()->GetDeviceContext(cmn::MediaCodecModuleId::NVENC, _output_track->GetCodecDeviceId());
-		auto out_resolution = _output_track->GetResolution();
-		if (_graph.ApplyCudaHwContext(hw_device_ctx, out_resolution.width, out_resolution.height) == false)
+		int32_t hw_frame_width = _src_width;
+		int32_t hw_frame_height = _src_height;
+		if (_graph.ApplyCudaHwContext(hw_device_ctx, hw_frame_width, hw_frame_height) == false)
 		{
 			logte("[%s] Could not apply CUDA hw context to filter graph", GetLogPrefix().CStr());
 			SetState(State::ERROR);
 
 			return false;
 		}
+	}
+
+	if (_graph.Config() == false)
+	{
+		logte("[%s] Could not validate filter graph for rescaling: %s", GetLogPrefix().CStr(), _graph.GetLastErrorString().CStr());
+		SetState(State::ERROR);
+
+		return false;
 	}
 
 	SetState(State::STARTED);

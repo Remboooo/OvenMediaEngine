@@ -8,6 +8,7 @@
 //==============================================================================
 #include "decoder_avcodec_video.h"
 
+#include "../../transcoder_gpu.h"
 #include "../../transcoder_private.h"
 #include "base/info/application.h"
 
@@ -23,23 +24,41 @@ bool AVCodecVideoDecoder::Initialize()
 	}
 
 	const char *decoder_name = nullptr;
-	switch (GetCodecID())
+	if (_module_id == cmn::MediaCodecModuleId::NVENC)
 	{
-		case cmn::MediaCodecId::H264:
-			decoder_name = "h264";
-			break;
-		case cmn::MediaCodecId::H265:
-			decoder_name = "hevc";
-			break;
-		case cmn::MediaCodecId::Vp8:
-			decoder_name = "vp8";
-			break;
-		case cmn::MediaCodecId::Av1:
-			decoder_name = "libaom-av1";
-			break;
-		default:
-			logte("Unsupported codec for video decoder: %s", cmn::GetCodecIdString(GetCodecID()));
-			return false;
+		switch (GetCodecID())
+		{
+			case cmn::MediaCodecId::H264:
+				decoder_name = "h264_cuvid";
+				break;
+			case cmn::MediaCodecId::H265:
+				decoder_name = "hevc_cuvid";
+				break;
+			default:
+				logte("Unsupported codec for NVDEC decoder: %s", cmn::GetCodecIdString(GetCodecID()));
+				return false;
+		}
+	}
+	else
+	{
+		switch (GetCodecID())
+		{
+			case cmn::MediaCodecId::H264:
+				decoder_name = "h264";
+				break;
+			case cmn::MediaCodecId::H265:
+				decoder_name = "hevc";
+				break;
+			case cmn::MediaCodecId::Vp8:
+				decoder_name = "vp8";
+				break;
+			case cmn::MediaCodecId::Av1:
+				decoder_name = "libaom-av1";
+				break;
+			default:
+				logte("Unsupported codec for video decoder: %s", cmn::GetCodecIdString(GetCodecID()));
+				return false;
+		}
 	}
 
 	if (_codec.AllocDecoderByName(decoder_name) == false)
@@ -49,8 +68,27 @@ bool AVCodecVideoDecoder::Initialize()
 	}
 
 	_codec.SetTimeBase(GetTimebase());
+	_codec.SetPacketTimeBase(GetTimebase());
 	_codec.SetThreadCount(GetRefTrack()->GetThreadCount());
 	_codec.SetThreadTypeFrame();
+
+	if (_module_id == cmn::MediaCodecModuleId::NVENC)
+	{
+		auto hw_device_ctx = TranscodeGPU::GetInstance()->GetDeviceContext(cmn::MediaCodecModuleId::NVENC, GetDeviceID());
+		if (hw_device_ctx == nullptr)
+		{
+			logte("Could not get hw device context for %s decoder", cmn::GetCodecIdString(GetCodecID()));
+			return false;
+		}
+
+		if (_codec.SetHwDeviceContext(hw_device_ctx) == false)
+		{
+			logte("Could not set hw device context for %s decoder", cmn::GetCodecIdString(GetCodecID()));
+			return false;
+		}
+
+		_codec.SetLowDelay();
+	}
 
 	if (_codec.Open() == false)
 	{
