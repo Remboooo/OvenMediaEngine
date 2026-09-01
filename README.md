@@ -8,6 +8,8 @@
 [![Docker Pulls (current)](https://img.shields.io/docker/pulls/ovenmedialabs/ovenmediaengine?label=docker%20pulls%20(current)&color=blue)](https://hub.docker.com/r/ovenmedialabs/ovenmediaengine)
 [![Docker Pulls (legacy)](https://img.shields.io/docker/pulls/airensoft/ovenmediaengine?label=docker%20pulls%20(legacy)&color=lightgrey)](https://hub.docker.com/r/airensoft/ovenmediaengine)
 
+> **Fork notice:** This is an **unsupported, poorly maintained** fork of [OvenMediaEngine](https://github.com/AirenSoft/OvenMediaEngine). It attempts to keep **NVIDIA NVENC/NVDEC** hardware transcoding working on **OME 0.21.0 and later**. For official releases, documentation, and support, use the upstream project.
+
 ## What is OvenMediaEngine?
 <img src="dist/OME_LLHLS_220610.svg" style="max-width: 100%; height: auto;">
 
