@@ -76,6 +76,10 @@ LLHlsSession::LLHlsSession(const info::Session &session_info,
 	{
 		_session_key = ov::Random::GenerateString(8);
 	}
+	else
+	{
+		_session_key = session_key;
+	}
 
 	if (_origin_mode == true)
 	{
@@ -588,7 +592,6 @@ void LLHlsSession::ResponseChunklist(const std::shared_ptr<http::svr::HttpExchan
 		content_encoding = "gzip";
 	}
 
-	// Get the chunklist
 	auto query_string = MakeQueryStringToPropagate(request_uri);
 
 	auto [result, chunklist] = llhls_stream->GetChunklist(query_string, track_id, msn, part, skip, gzip, legacy, rewind);
@@ -962,6 +965,17 @@ bool LLHlsSession::AddPendingRequest(const std::shared_ptr<http::svr::HttpExchan
 
 ov::String LLHlsSession::MakeQueryStringToPropagate(const std::shared_ptr<ov::Url> &request_uri)
 {
+	// Prefer the in-memory key; if missing (e.g. session recreated from URL before
+	// the key was stored), recover it from the request's session= query.
+	if (_session_key.IsEmpty() && request_uri != nullptr && request_uri->HasQueryKey("session"))
+	{
+		auto parts = request_uri->GetQueryValue("session").Split("_", 2);
+		if (parts.size() == 2 && parts[1].IsEmpty() == false)
+		{
+			_session_key = parts[1];
+		}
+	}
+
 	auto query_string = ov::String::FormatString("session=%u_%s", GetId(), _session_key.CStr());
 	if (_origin_mode == true)
 	{
@@ -971,7 +985,7 @@ ov::String LLHlsSession::MakeQueryStringToPropagate(const std::shared_ptr<ov::Ur
 
 	// stream_key is propagated to the child resources
 	ov::String stream_key;
-	if (request_uri->HasQueryKey("stream_key"))
+	if (request_uri != nullptr && request_uri->HasQueryKey("stream_key"))
 	{
 		stream_key = request_uri->GetQueryValue("stream_key");
 	}

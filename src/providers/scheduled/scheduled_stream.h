@@ -12,6 +12,8 @@
 #include <orchestrator/orchestrator.h>
 #include <mediarouter/mediarouter_stream_tap.h>
 #include <base/provider/stream.h>
+#include <modules/segment_cache/options.h>
+#include <modules/segment_cache/source_session.h>
 
 #include "schedule.h"
 
@@ -54,8 +56,27 @@ namespace pvd
             PLAY_NEXT_ITEM,
             PLAY_NEXT_PROGRAM,
             ERROR,
-            FAILBACK
+            FAILBACK,
+            // Idle cache mode woke because WebRTC/OVT demand appeared; demux should run.
+            RESUME_PUMP
         };
+
+        // Segment-cache idle pump: WebRTC/OVT sessions only (not HLS/LLHLS).
+        uint32_t GetPumpDemandCount() const;
+        bool ShouldRunMediaPump() const;
+        // True once HLS/LLHLS/WebRTC publisher streams have left CREATED (MediaRouter prepared).
+        bool AreEgressPublishersStarted() const;
+        int64_t GetPumpGracePeriodMs() const;
+        segment_cache::Options ResolveSegmentCacheOptions() const;
+        PlaybackResult PlayFileIdle(const std::shared_ptr<Schedule::Item> &item, bool fallback_item);
+
+		// Wall-clock cache playhead: while IsCacheServeEnabled, HLS/LLHLS MSN must
+		// advance at 1x wall even if demux bursts after a WebRTC seek.
+		void AnchorCachePlayhead(int64_t elapsed_ms);
+		void TickCachePlayhead(const std::shared_ptr<segment_cache::SourceSession> &session,
+							   int64_t item_duration_ms);
+		// Ask LLHLS (and peers) to sync idle playlists / wake blocking reloads.
+		void NotifyCachePlayheadToPublishers();
 
         // If there is no current program
         //      ==> Continue playing until the current program changes
@@ -126,5 +147,14 @@ namespace pvd
         ov::StopWatch _failback_check_clock;
 
         std::map<uint32_t, std::shared_ptr<MediaPacket>> _last_packet_map;
+
+		// Pump gate: true while demux loop is active (grace applies on drop to 0).
+		mutable std::atomic<bool> _media_pump_running{false};
+		// Monotonic ms when demand last dropped to 0 while pump was running; -1 = not timing.
+		mutable std::atomic<int64_t> _pump_demand_zero_since_ms{-1};
+
+		// Anchor for wall-driven cache playhead (mono ms, elapsed ms at that mono).
+		int64_t _cache_playhead_anchor_mono_ms{-1};
+		int64_t _cache_playhead_anchor_elapsed_ms{0};
     };
 }

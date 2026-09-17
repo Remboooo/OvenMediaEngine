@@ -4,11 +4,11 @@
 //
 //  Created by Getroot
 //  Copyright (c) 2023 AirenSoft. All rights reserved.
-//
 //==============================================================================
 #pragma once
 
 #include "provider.h"
+#include "segment_cache.h"
 
 namespace cfg
 {
@@ -25,6 +25,7 @@ namespace cfg
 					ov::String _schedule_files_dir;
 					// Rename removed schedule files with a timestamp instead of deleting them
 					bool _preserve_removed_schedule_file = false;
+					SegmentCache _segment_cache;
 
 				public:
 					ProviderType GetType() const override
@@ -35,6 +36,7 @@ namespace cfg
 					CFG_DECLARE_CONST_REF_GETTER_OF(GetMediaRootDir, _media_root_dir)
 					CFG_DECLARE_CONST_REF_GETTER_OF(GetScheduleFilesDir, _schedule_files_dir)
 					CFG_DECLARE_CONST_REF_GETTER_OF(IsPreserveRemovedScheduleFile, _preserve_removed_schedule_file)
+					CFG_DECLARE_CONST_REF_GETTER_OF(GetSegmentCache, _segment_cache)
 
 				protected:
 					void MakeList() override
@@ -44,6 +46,7 @@ namespace cfg
 						Register("MediaRootDir", &_media_root_dir);
 						Register("ScheduleFilesDir", &_schedule_files_dir);
 						Register<Optional>("PreserveRemovedScheduleFile", &_preserve_removed_schedule_file);
+						Register<Optional>("SegmentCache", &_segment_cache);
 					}
 				};
 			}  // namespace pvd

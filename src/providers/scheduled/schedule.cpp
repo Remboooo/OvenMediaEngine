@@ -491,6 +491,36 @@ namespace pvd
 			_stream._max_fallback_duration_ms = max_fallback_duration_ms_object.asInt64();
 		}
 
+		auto segment_cache_object = stream_object["segmentCache"];
+		if (segment_cache_object.isNull() == false)
+		{
+			bool enable = false;
+			if (segment_cache_object.isBool())
+			{
+				enable = segment_cache_object.asBool();
+			}
+			else if (segment_cache_object.isObject())
+			{
+				auto enable_object = segment_cache_object["enable"];
+				if (enable_object.isBool())
+				{
+					enable = enable_object.asBool();
+				}
+			}
+			else
+			{
+				_last_error = "segmentCache must be a boolean or object with enable";
+				return false;
+			}
+
+			_stream._segment_cache_enable = enable;
+			if (enable && _stream._bypass_transcoder == false)
+			{
+				logtw("SegmentCache enabled with BypassTranscoder=false in schedule — "
+					  "cache will be skipped at play time (demux/transcode path)");
+			}
+		}
+
 		return true;
 	}
 
@@ -861,6 +891,29 @@ namespace pvd
 			_stream._max_fallback_duration_ms = max_fallback_duration_ms_node.text().as_llong();
 		}
 
+		// Optional per-stream SegmentCache enable (inherits Server.xml when omitted).
+		auto segment_cache_node = stream_node.child("SegmentCache");
+		if (segment_cache_node)
+		{
+			bool enable = false;
+			auto enable_node = segment_cache_node.child("Enable");
+			if (enable_node)
+			{
+				enable = enable_node.text().as_bool();
+			}
+			else if (segment_cache_node.text() && segment_cache_node.text().get()[0] != '\0')
+			{
+				// Allow <SegmentCache>true</SegmentCache>
+				enable = segment_cache_node.text().as_bool();
+			}
+			_stream._segment_cache_enable = enable;
+			if (enable && _stream._bypass_transcoder == false)
+			{
+				logtw("SegmentCache enabled with BypassTranscoder=false in schedule — "
+					  "cache will be skipped at play time (demux/transcode path)");
+			}
+		}
+
 		return true;
 	}
 
@@ -1225,6 +1278,12 @@ namespace pvd
 		// MaxFallbackDurationMs
 		stream_node.append_child("MaxFallbackDurationMs").text().set(_stream._max_fallback_duration_ms);
 
+		if (_stream._segment_cache_enable.has_value())
+		{
+			auto segment_cache_node = stream_node.append_child("SegmentCache");
+			segment_cache_node.append_child("Enable").text().set(_stream._segment_cache_enable.value());
+		}
+
 		// FallbackProgram
 		if (_fallback_program != nullptr)
 		{
@@ -1298,6 +1357,13 @@ namespace pvd
 
 		// max_fallback_duration_ms
 		stream_object["maxFallbackDurationMs"] = _stream._max_fallback_duration_ms;
+
+		if (_stream._segment_cache_enable.has_value())
+		{
+			Json::Value segment_cache_object;
+			segment_cache_object["enable"] = _stream._segment_cache_enable.value();
+			stream_object["segmentCache"] = segment_cache_object;
+		}
 
 		root_object["stream"] = stream_object;
 

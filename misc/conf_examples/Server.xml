@@ -504,6 +504,20 @@
 						<Schedule>
 							<MediaRootDir>/opt/ovenmediaengine/media</MediaRootDir>
 							<ScheduleFilesDir>/opt/ovenmediaengine/media</ScheduleFilesDir>
+							<!-- Bypass H.264+AAC MP4 preferred; unsupported media warns and demux-falls-back -->
+							<!-- MaxThroughputMbps is aggregate for sample-index Build + greedy hydrate (0 = unlimited) -->
+							<!--
+							<SegmentCache>
+								<Enable>true</Enable>
+								<Mode>persist</Mode>
+								<Hydrate>
+									<Mode>greedy</Mode>
+									<MaxThreads>2</MaxThreads>
+									<MaxThroughputMbps>50</MaxThroughputMbps>
+								</Hydrate>
+								<IdleGracePeriodMs>30000</IdleGracePeriodMs>
+							</SegmentCache>
+							-->
 						</Schedule>
 					</Providers>
 					<Publishers>

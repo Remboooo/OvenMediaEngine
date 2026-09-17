@@ -69,6 +69,8 @@ public:
 	void SetEndList();
 
 	std::size_t GetSegmentCount() const;
+	bool HasSegment(int64_t number) const;
+	void ClearSegments();
 
 private:
 	// Recompute the cached CODECS union. Caller must hold _segments_mutex exclusively.

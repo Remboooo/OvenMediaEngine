@@ -11,6 +11,8 @@
 #include <base/ovlibrary/hex.h>
 #include <config/config_manager.h>
 #include <modules/dump/dump.h>
+#include <modules/segment_cache/idle_playlist_driver.h>
+#include <modules/segment_cache/source_session.h>
 
 #include <pugixml-1.9/src/pugixml.hpp>
 
@@ -345,6 +347,13 @@ bool HlsStream::SendBufferedPackets()
 
 bool HlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_packet)
 {
+	// Cache-serve owns HLS playlists/segments once a SourceSession is registered.
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()) &&
+		segment_cache::SessionRegistry::GetInstance().Find(GetName()) != nullptr)
+	{
+		return true;
+	}
+
 	std::shared_lock<std::shared_mutex> lock(_ts_packetizers_guard);
 	auto it = _track_packetizers.find(media_packet->GetTrackId());
 	if (it == _track_packetizers.end())
@@ -572,6 +581,17 @@ bool HlsStream::CheckIfAllPlaylistReady()
 
 void HlsStream::OnSegmentCreated(const ov::String &packager_id, const std::shared_ptr<base::modules::Segment> &segment)
 {
+	// Idle (and post-idle) cache serve owns the media playlist; ignore packager
+	// segments so demux-for-WebRTC does not fight the cache window.
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		if (CheckIfAllPlaylistReady() == true)
+		{
+			_ready_to_play = true;
+		}
+		return;
+	}
+
 	if (CheckIfAllPlaylistReady() == true)
 	{
 		_ready_to_play = true;
@@ -658,6 +678,11 @@ void HlsStream::OnSegmentCreated(const ov::String &packager_id, const std::share
 
 void HlsStream::OnSegmentDeleted(const ov::String &packager_id, const std::shared_ptr<base::modules::Segment> &segment)
 {
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		return;
+	}
+
 	auto playlist = GetMediaPlaylist(packager_id);
 	if (playlist == nullptr)
 	{
@@ -1263,17 +1288,120 @@ std::tuple<HlsStream::RequestResult, std::shared_ptr<const ov::Data>> HlsStream:
 		return std::make_tuple(RequestResult::NotFound, nullptr);
 	}
 
-	auto data = playlist->ToString(rewind).ToData(false);
-	if (data == nullptr)
 	{
-		return std::make_tuple(RequestResult::UnknownError, nullptr);
+		std::lock_guard<std::mutex> rebuild_lock(_idle_rebuild_mutex);
+		if (SyncIdlePlaylistIfEnabled(variant_name, playlist))
+		{
+			if (CheckIfAllPlaylistReady() == true)
+			{
+				_ready_to_play = true;
+			}
+		}
+
+		auto data = playlist->ToString(rewind).ToData(false);
+		if (data == nullptr)
+		{
+			return std::make_tuple(RequestResult::UnknownError, nullptr);
+		}
+
+		return std::make_tuple(RequestResult::Success, data);
+	}
+}
+
+bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const std::shared_ptr<HlsMediaPlaylist> &playlist)
+{
+	if (playlist == nullptr)
+	{
+		return false;
 	}
 
-	return std::make_tuple(RequestResult::Success, data);
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()) == false)
+	{
+		return false;
+	}
+
+	auto session = registry.Find(GetName());
+	if (session == nullptr || session->GetPlan().segments.empty())
+	{
+		return false;
+	}
+
+	segment_cache::IdlePlaylistDriver::Config cfg;
+	cfg.window_segments = std::max<size_t>(1, _ts_config.GetSegmentCount());
+	segment_cache::IdlePlaylistDriver driver(session, cfg);
+	driver.SetEpochElapsedMs(session->GetElapsedMs());
+
+	const auto &window = driver.GetWindow();
+	if (window.empty())
+	{
+		return false;
+	}
+
+	const int64_t edge_msn = window.back().media_sequence;
+	{
+		std::lock_guard<std::mutex> lock(_idle_synced_lock);
+		auto it = _idle_synced_edge_msn.find(variant_name);
+		if (it != _idle_synced_edge_msn.end() && it->second == edge_msn)
+		{
+			return true;
+		}
+		_idle_synced_edge_msn[variant_name] = edge_msn;
+	}
+
+	if (playlist->GetWallclockOffset() == INT64_MIN)
+	{
+		playlist->SetWallclockOffset(0);
+	}
+
+	const size_t plan_size = session->GetPlan().segments.size();
+
+	// Replace packager playlist wholesale when serving from idle cache.
+	playlist->ClearSegments();
+
+	for (const auto &entry : window)
+	{
+		auto segment = std::make_shared<mpegts::Segment>(entry.media_sequence, entry.start_dts, entry.duration_ms);
+		segment->SetUrl(GetSegmentName(variant_name, static_cast<uint32_t>(entry.media_sequence)));
+		if (plan_size > 0 && entry.plan_ordinal == 0 &&
+			entry.media_sequence >= static_cast<int64_t>(plan_size))
+		{
+			segment->SetDiscontinuityPoint(true);
+		}
+		playlist->OnSegmentCreated(segment);
+	}
+
+	return playlist->GetSegmentCount() > 0;
 }
 
 std::tuple<HlsStream::RequestResult, std::shared_ptr<const ov::Data>> HlsStream::GetSegmentData(const ov::String &variant_name, uint32_t number)
 {
+	// Segment cache path — only while ScheduledStream is in idle (pump off).
+	// While demuxing, the live packager owns playlists/segments.
+	{
+		auto &registry = segment_cache::SessionRegistry::GetInstance();
+		if (registry.IsCacheServeEnabled(GetName()))
+		{
+			auto session = registry.Find(GetName());
+			if (session != nullptr)
+			{
+				// Client GET implies demand — keep the live window hot so HLS does
+				// not stall on cold rematerialize (idle loop does not warm).
+				session->MaybeWarmPlayheadWindow(24, 2000);
+				const size_t plan_size = session->GetPlan().segments.size();
+				if (plan_size > 0)
+				{
+					const size_t ordinal = static_cast<size_t>(number) % plan_size;
+					auto cached = session->GetHlsTsSegment(ordinal);
+					if (cached != nullptr)
+					{
+						return std::make_tuple(RequestResult::Success, cached);
+					}
+				}
+			}
+		}
+	}
+
 	auto storage = GetStorage(variant_name);
 	if (storage == nullptr)
 	{

@@ -19,6 +19,8 @@
 
 #include <pugixml-1.9/src/pugixml.hpp>
 
+#include <modules/segment_cache/idle_playlist_driver.h>
+#include <modules/segment_cache/source_session.h>
 #include <modules/task_pool/task_pool.h>
 
 #include "llhls_application.h"
@@ -952,7 +954,7 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 		return {RequestResult::NotFound, nullptr};
 	}
 
-	if (IsReadyToPlay() == false)
+	if (IsReadyToPlay() == false && TryMarkReadyFromSegmentCache() == false)
 	{
 		return {RequestResult::Accepted, nullptr};
 	}
@@ -997,7 +999,7 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 	return {RequestResult::Success, master_playlist->ToString(chunk_query_string, legacy, rewind, include_path).ToData(false)};
 }
 
-std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStream::GetChunklist(const ov::String &query_string, const int32_t &track_id, int64_t msn, int64_t psn, bool skip, bool gzip, bool legacy, bool rewind) const
+std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStream::GetChunklist(const ov::String &query_string, const int32_t &track_id, int64_t msn, int64_t psn, bool skip, bool gzip, bool legacy, bool rewind)
 {
 	auto chunklist = GetChunklistWriter(track_id);
 	if (chunklist == nullptr)
@@ -1006,7 +1008,19 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 		return {RequestResult::NotFound, nullptr};
 	}
 
-	if (IsReadyToPlay() == false)
+	// Hold rebuild mutex across sync + msn check + serialize so clients never
+	// observe last_msn=-1 between ClearAll and refill (blocking reload hang).
+	std::unique_lock<std::shared_mutex> rebuild_lock(_idle_rebuild_mutex);
+	SyncIdleChunklistIfEnabled(track_id);
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()) == false)
+	{
+		// Restore configured PRELOAD-HINT when leaving idle cache serve.
+		chunklist->SetPreloadHintEnabled(_preload_hint_enabled);
+		std::lock_guard<std::mutex> lock(_idle_synced_lock);
+		_idle_synced_edge.erase(track_id);
+	}
+
+	if (IsReadyToPlay() == false && TryMarkReadyFromSegmentCache() == false)
 	{
 		return {RequestResult::Accepted, nullptr};
 	}
@@ -1020,6 +1034,17 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 			return {RequestResult::NotFound, nullptr};
 		}
 
+		// Empty window should not happen under rebuild_lock after SyncIdle; if it
+		// does, return current playlist rather than blocking forever on last_msn=-1.
+		if (last_msn < 0)
+		{
+			if (gzip == true)
+			{
+				return {RequestResult::Success, chunklist->ToGzipData(query_string, skip, legacy, rewind)};
+			}
+			return {RequestResult::Success, chunklist->ToString(query_string, skip, legacy, rewind).ToData(false)};
+		}
+
 		// When _HLS_part is omitted, treat it as part 0 so the request blocks until
 		// the first partial segment of the requested MSN is available (Safari sends
 		// _HLS_msn without _HLS_part to wait for a new segment's first part).
@@ -1027,7 +1052,8 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 
 		if (msn > last_msn || (msn >= last_msn && requested_psn > last_psn))
 		{
-			// Hold the request until a Playlist contains a Segment with the requested Sequence Number
+			// Release rebuild lock before parking the HTTP request.
+			rebuild_lock.unlock();
 			logtt("Accepted chunklist for track_id = %d, msn = %ld, psn = %ld (requested_psn = %ld, last_msn = %ld, last_psn = %ld)", track_id, msn, psn, requested_psn, last_msn, last_psn);
 			return {RequestResult::Accepted, nullptr};
 		}
@@ -1045,8 +1071,210 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<const ov::Data>> LLHlsStr
 	return {RequestResult::Success, chunklist->ToString(query_string, skip, legacy, rewind).ToData(false)};
 }
 
+bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
+{
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()) == false)
+	{
+		return false;
+	}
+
+	auto session = registry.Find(GetName());
+	if (session == nullptr || session->GetPlan().segments.empty())
+	{
+		return false;
+	}
+
+	auto chunklist = GetChunklistWriter(track_id);
+	if (chunklist == nullptr)
+	{
+		return false;
+	}
+
+	segment_cache::IdlePlaylistDriver::Config cfg;
+	cfg.window_segments = std::max<size_t>(1, static_cast<size_t>(_storage_config.max_segments));
+	segment_cache::IdlePlaylistDriver driver(session, cfg);
+	driver.SetEpochElapsedMs(session->GetElapsedMs());
+
+	const auto &window = driver.GetWindow();
+	if (window.empty())
+	{
+		return false;
+	}
+
+	const auto head = session->ResolvePlayhead(session->GetElapsedMs());
+	const int64_t edge_msn = window.back().media_sequence;
+	const size_t edge_part = head.part_ordinal;
+	{
+		std::lock_guard<std::mutex> lock(_idle_synced_lock);
+		auto it = _idle_synced_edge.find(track_id);
+		if (it != _idle_synced_edge.end() &&
+			it->second.first == edge_msn &&
+			it->second.second == edge_part)
+		{
+			// Window unchanged — leave chunklist as-is so clients keep monotonic DTS.
+			return true;
+		}
+		_idle_synced_edge[track_id] = {edge_msn, edge_part};
+	}
+
+	const auto &plan = session->GetPlan();
+	const size_t plan_size = plan.segments.size();
+	const ov::String map_uri = GetInitializationSegmentName(track_id);
+	const int64_t item_duration_ms = std::max<int64_t>(1, session->GetItemDurationMs());
+	const int64_t position_ms = session->GetElapsedMs() % item_duration_ms;
+	const int64_t now_ms = ov::Time::GetTimestampInMs();
+	const int64_t plan_origin_dts = plan.segments.front().start_dts;
+
+	// Idle playlists are fully deterministic from the cache window. PRELOAD-HINT
+	// would point at the next part and block LL-HLS clients until playhead moves.
+	chunklist->SetPreloadHintEnabled(false);
+
+	// Replace the live packager window entirely. Merging leaves PRELOAD-HINT /
+	// half-open segments behind and freezes MEDIA-SEQUENCE at 0.
+	chunklist->ClearAllSegmentInfo();
+
+	// PART-TARGET must match real part durations. Cache parts are keyframe-aligned
+	// (often ~1s GOP) even when Server.xml ChunkDuration is smaller (e.g. 0.2s).
+	double max_part_duration_sec = 0.0;
+
+	for (size_t wi = 0; wi < window.size(); wi++)
+	{
+		const auto &entry = window[wi];
+		const auto seq = static_cast<uint32_t>(entry.media_sequence);
+		const bool is_live_edge = (wi + 1 == window.size());
+
+		chunklist->CreateSegmentInfo(LLHlsChunklist::SegmentInfo(seq, GetSegmentName(track_id, entry.media_sequence)));
+
+		const auto &planned = plan.segments[entry.plan_ordinal];
+		std::vector<segment_cache::PlannedPart> parts = planned.parts;
+		if (parts.empty())
+		{
+			segment_cache::PlannedPart whole;
+			whole.start_dts = planned.start_dts;
+			whole.end_dts = planned.end_dts;
+			parts.push_back(whole);
+		}
+
+		// Live edge: only advertise parts up to the wall-clock playhead so
+		// CAN-BLOCK-RELOAD can wait for the next part instead of seeing a closed edge.
+		const size_t publish_parts =
+			is_live_edge ? std::min(parts.size(), edge_part + 1) : parts.size();
+
+		for (size_t p = 0; p < publish_parts; p++)
+		{
+			const auto &part = parts[p];
+			const double duration_sec = static_cast<double>(part.end_dts - part.start_dts) / 90000.0;
+			max_part_duration_sec = std::max(max_part_duration_sec, duration_sec);
+			const int64_t part_pos_ms = (part.start_dts - plan_origin_dts) / 90;
+			const int64_t start_ms = now_ms - position_ms + part_pos_ms;
+			const bool is_last_published = (p + 1 == publish_parts);
+			const bool completes_segment = (is_live_edge == false && is_last_published);
+			const auto part_url = GetPartialSegmentName(track_id, entry.media_sequence, static_cast<int64_t>(p));
+			ov::String next_url;
+			if (is_last_published == false)
+			{
+				next_url = GetPartialSegmentName(track_id, entry.media_sequence, static_cast<int64_t>(p + 1));
+			}
+			else if (is_live_edge == false)
+			{
+				next_url = GetPartialSegmentName(track_id, entry.media_sequence + 1, 0);
+			}
+
+			// completed=true marks the whole parent segment done — only the final
+			// part of non-edge segments may set it (mirrors last_chunk in live path).
+			auto info = LLHlsChunklist::SegmentInfo(static_cast<uint32_t>(p), start_ms, duration_sec, 0,
+													part_url, next_url, true /*independent*/, completes_segment);
+			info.SetMapUri(map_uri);
+			info.SetTrackVersion(1);
+			if (plan_size > 0 && entry.plan_ordinal == 0 &&
+				entry.media_sequence >= static_cast<int64_t>(plan_size))
+			{
+				info.SetDiscontinuity();
+			}
+			chunklist->AppendPartialSegmentInfo(seq, info);
+		}
+
+		// Complete every segment except the live edge so clients treat the window
+		// like a sliding LL-HLS edge without a dangling PRELOAD-HINT.
+		if (is_live_edge == false)
+		{
+			chunklist->CompleteSegmentInfo(seq, GetPartialSegmentName(track_id, entry.media_sequence + 1, 0), map_uri);
+		}
+	}
+
+	if (max_part_duration_sec > 0.0)
+	{
+		chunklist->SetPartTargetDuration(max_part_duration_sec);
+		// PART-HOLD-BACK must be >= 3× PART-TARGET for LL-HLS clients.
+		const double part_hold_back = std::max({_configured_part_hold_back, max_part_duration_sec * 3.0, 1.0});
+		chunklist->SetPartHoldBack(static_cast<float>(part_hold_back));
+	}
+
+	{
+		std::lock_guard<std::shared_mutex> lock(_playlist_ready_lock);
+		if (_playlist_ready == false)
+		{
+			_playlist_ready = true;
+			logti("LLHlsStream(%s/%s) - Ready to play via idle segment cache",
+				  GetApplication()->GetVHostAppName().CStr(), GetName().CStr());
+		}
+	}
+
+	int64_t last_msn = -1, last_psn = -1;
+	if (chunklist->GetLastSequenceNumber(last_msn, last_psn))
+	{
+		// Wake CAN-BLOCK-RELOAD / part holds — packager callbacks are skipped under cache-serve.
+		NotifyPlaylistUpdated(track_id, last_msn, last_psn);
+	}
+
+	return true;
+}
+
+void LLHlsStream::OnSegmentCachePlayheadTick()
+{
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()) == false)
+	{
+		return;
+	}
+
+	std::vector<int32_t> track_ids;
+	{
+		std::shared_lock<std::shared_mutex> lock(_chunklist_map_lock);
+		track_ids.reserve(_chunklist_map.size());
+		for (const auto &[track_id, chunklist] : _chunklist_map)
+		{
+			if (chunklist != nullptr)
+			{
+				track_ids.push_back(track_id);
+			}
+		}
+	}
+
+	std::unique_lock<std::shared_mutex> rebuild_lock(_idle_rebuild_mutex);
+	for (const int32_t track_id : track_ids)
+	{
+		SyncIdleChunklistIfEnabled(track_id);
+	}
+}
+
 std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::GetInitializationSegment(const int32_t &track_id) const
 {
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()))
+	{
+		auto session = registry.Find(GetName());
+		auto track = GetTrack(track_id);
+		if (session != nullptr && track != nullptr)
+		{
+			auto cached = session->GetFmp4Init(track->GetMediaType());
+			if (cached != nullptr)
+			{
+				return {RequestResult::Success, cached->Clone()};
+			}
+		}
+	}
+
 	auto storage = GetStorage(track_id);
 	if (storage == nullptr)
 	{
@@ -1059,6 +1287,21 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::G
 
 std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::GetInitializationSegment(const int32_t &track_id, uint32_t track_version) const
 {
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()))
+	{
+		auto session = registry.Find(GetName());
+		auto track = GetTrack(track_id);
+		if (session != nullptr && track != nullptr)
+		{
+			auto cached = session->GetFmp4Init(track->GetMediaType());
+			if (cached != nullptr)
+			{
+				return {RequestResult::Success, cached->Clone()};
+			}
+		}
+	}
+
 	auto storage = GetFmp4Storage(track_id);
 	if (storage == nullptr)
 	{
@@ -1078,6 +1321,28 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::G
 
 std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::GetSegment(const int32_t &track_id, const int64_t &segment_number) const
 {
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()))
+	{
+		auto session = registry.Find(GetName());
+		auto track = GetTrack(track_id);
+		if (session != nullptr && track != nullptr)
+		{
+			// Client GET implies demand — refresh the hot window (not inside Get*).
+			session->MaybeWarmPlayheadWindow(24, 2000);
+			const size_t plan_size = session->GetPlan().segments.size();
+			if (plan_size > 0 && segment_number >= 0)
+			{
+				const size_t ordinal = static_cast<size_t>(segment_number) % plan_size;
+				auto cached = session->GetFmp4Segment(track->GetMediaType(), ordinal);
+				if (cached != nullptr)
+				{
+					return {RequestResult::Success, cached->Clone()};
+				}
+			}
+		}
+	}
+
 	auto storage = GetStorage(track_id);
 	if (storage == nullptr)
 	{
@@ -1098,6 +1363,37 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::G
 std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::GetPartial(const int32_t &track_id, const int64_t &segment_number, const int64_t &partial_number) const
 {
 	logtt("LLHlsStream(%s) - GetChunk(%d, %ld, %ld)", GetName().CStr(), track_id, segment_number, partial_number);
+
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()))
+	{
+		auto session = registry.Find(GetName());
+		auto track = GetTrack(track_id);
+		if (session != nullptr && track != nullptr && segment_number >= 0 && partial_number >= 0)
+		{
+			session->MaybeWarmPlayheadWindow(24, 2000);
+			const auto &plan = session->GetPlan();
+			const size_t plan_size = plan.segments.size();
+			if (plan_size > 0)
+			{
+				const size_t seg_ord = static_cast<size_t>(segment_number) % plan_size;
+				const auto &seg = plan.segments[seg_ord];
+				if (seg.parts.empty() == false &&
+					static_cast<size_t>(partial_number) < seg.parts.size())
+				{
+					auto cached = session->GetFmp4Part(track->GetMediaType(), seg_ord,
+													   static_cast<size_t>(partial_number));
+					if (cached != nullptr)
+					{
+						return {RequestResult::Success, cached->Clone()};
+					}
+				}
+			}
+		}
+		// Idle cache miss: never fall through to the (empty) live packager hold,
+		// which would block LL-HLS clients indefinitely on PRELOAD / future parts.
+		return {RequestResult::NotFound, nullptr};
+	}
 
 	auto storage = GetStorage(track_id);
 	if (storage == nullptr)
@@ -1793,6 +2089,15 @@ bool LLHlsStream::AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_pa
 		return true;
 	}
 
+	// Idle/cache-serve owns the LLHLS playlist once a SourceSession is registered.
+	// Until Open() finishes, keep feeding the live packager so the master playlist
+	// can become ready (otherwise clients hang on Accepted forever).
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()) &&
+		segment_cache::SessionRegistry::GetInstance().Find(GetName()) != nullptr)
+	{
+		return true;
+	}
+
 	// Get Packager
 	auto packager = GetPackager(track->GetId());
 	if (packager == nullptr)
@@ -2284,6 +2589,30 @@ bool LLHlsStream::IsReadyToPlay() const
 	return _playlist_ready;
 }
 
+bool LLHlsStream::TryMarkReadyFromSegmentCache()
+{
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	if (registry.IsCacheServeEnabled(GetName()) == false)
+	{
+		return false;
+	}
+
+	auto session = registry.Find(GetName());
+	if (session == nullptr || session->GetPlan().segments.empty())
+	{
+		return false;
+	}
+
+	std::lock_guard<std::shared_mutex> lock(_playlist_ready_lock);
+	if (_playlist_ready == false)
+	{
+		_playlist_ready = true;
+		logti("LLHlsStream(%s/%s) - Ready to play via segment cache (master/chunklist gate)",
+			  GetApplication()->GetVHostAppName().CStr(), GetName().CStr());
+	}
+	return true;
+}
+
 bool LLHlsStream::CheckPlaylistReady()
 {
 	// lock
@@ -2341,8 +2670,12 @@ void LLHlsStream::OnMediaSegmentCreated(const int32_t &track_id, const uint32_t 
 	SegCreateLog('S', GetName().CStr(), track_id, segment_number, -1);
 #endif	// OME_LATENCY_PROBE
 
-	// Check whether at least one segment of every track has been created.
 	CheckPlaylistReady();
+
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		return;
+	}
 
 	auto playlist = GetChunklistWriter(track_id);
 	if (playlist == nullptr)
@@ -2396,6 +2729,11 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 #ifdef OME_LATENCY_PROBE
 	SegCreateLog('C', GetName().CStr(), track_id, segment_number, chunk_number);
 #endif	// OME_LATENCY_PROBE
+
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		return;
+	}
 
 	auto playlist = GetChunklistWriter(track_id);
 	if (playlist == nullptr)
@@ -2585,6 +2923,11 @@ void LLHlsStream::OnMediaChunkUpdated(const int32_t &track_id, const uint32_t &s
 
 void LLHlsStream::OnMediaSegmentDeleted(const int32_t &track_id, const uint32_t &segment_number)
 {
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		return;
+	}
+
 	auto playlist = GetChunklistWriter(track_id);
 	if (playlist == nullptr)
 	{
@@ -2628,6 +2971,11 @@ void LLHlsStream::OnMediaSegmentDeleted(const int32_t &track_id, const uint32_t 
 
 void LLHlsStream::OnMediaSegmentCompleted(const int32_t &track_id, const uint32_t &segment_number)
 {
+	if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
+	{
+		return;
+	}
+
 	auto playlist = GetChunklistWriter(track_id);
 	if (playlist == nullptr)
 	{

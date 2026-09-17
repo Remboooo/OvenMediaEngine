@@ -289,9 +289,16 @@ public:
 
 	void SetPartHoldBack(const float &part_hold_back);
 
+	// Update PART-TARGET advertised in EXT-X-PART-INF (seconds).
+	void SetPartTargetDuration(double part_target_duration);
+
 	bool CreateSegmentInfo(const SegmentInfo &info);
 	bool AppendPartialSegmentInfo(uint32_t segment_sequence, const SegmentInfo &info);
 	bool RemoveSegmentInfo(uint32_t segment_sequence);
+	// Drop every listed segment (used when switching to idle cache playlists).
+	void ClearAllSegmentInfo();
+
+	void SetPreloadHintEnabled(bool enabled);
 
 	// Mark a segment completed without a new partial (track change boundary cut).
 	// The last partial advertised a next part that will never exist, so its next url

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <mutex>
+#include <shared_mutex>
 #include <optional>
 
 #include <base/common_types.h>
@@ -79,7 +80,7 @@ public:
 	const ov::String &GetStreamKey() const;
 
 	std::tuple<RequestResult, std::shared_ptr<const ov::Data>> GetMasterPlaylist(const ov::String &file_name, const ov::String &chunk_query_string, bool gzip, bool legacy, bool rewind, bool include_path=true);
-	std::tuple<RequestResult, std::shared_ptr<const ov::Data>> GetChunklist(const ov::String &chunk_query_string, const int32_t &track_id, int64_t msn, int64_t psn, bool skip, bool gzip, bool legacy, bool rewind) const;
+	std::tuple<RequestResult, std::shared_ptr<const ov::Data>> GetChunklist(const ov::String &chunk_query_string, const int32_t &track_id, int64_t msn, int64_t psn, bool skip, bool gzip, bool legacy, bool rewind);
 	std::tuple<RequestResult, std::shared_ptr<ov::Data>> GetInitializationSegment(const int32_t &track_id) const;
 	std::tuple<RequestResult, std::shared_ptr<ov::Data>> GetInitializationSegment(const int32_t &track_id, uint32_t track_version) const;
 	std::tuple<RequestResult, std::shared_ptr<ov::Data>> GetSegment(const int32_t &track_id, const int64_t &segment_number) const;
@@ -161,6 +162,9 @@ private:
 
 	void NotifyPlaylistUpdated(const int32_t &track_id, const int64_t &msn, const int64_t &part);
 
+	// Wake idle-cache LL-HLS blocking reloads when ScheduledChannel advances playhead.
+	void OnSegmentCachePlayheadTick() override;
+
 	// bmff::FMp4StorageObserver implementation
 	void OnFMp4StorageInitialized(const int32_t &track_id) override;
 	void OnMediaSegmentCreated(const int32_t &track_id, const uint32_t &segment_number) override;
@@ -204,7 +208,19 @@ private:
 	bool AppendMediaPacket(const std::shared_ptr<MediaPacket> &media_packet);
 
 	bool IsReadyToPlay() const;
+	// When SegmentCache serves, mark ready without waiting for live packager segments.
+	bool TryMarkReadyFromSegmentCache();
 	bool CheckPlaylistReady();
+
+	// Fill chunklist from IdlePlaylistDriver when segment cache serves.
+	bool SyncIdleChunklistIfEnabled(int32_t track_id);
+	// Serializes idle ClearAll+rebuild vs concurrent chunklist GETs (avoids last_msn=-1
+	// mid-rebuild which makes LL-HLS blocking reload hang).
+	mutable std::shared_mutex _idle_rebuild_mutex;
+	// Last idle window signature per track (live-edge MSN + part) to avoid
+	// ClearAll+rebuild on every playlist poll (non-monotonic DTS for clients).
+	std::map<int32_t, std::pair<int64_t, size_t>> _idle_synced_edge;
+	mutable std::mutex _idle_synced_lock;
 
 	void DumpMasterPlaylistsOfAllItems();
 	bool DumpMasterPlaylist(const std::shared_ptr<mdl::Dump> &item);

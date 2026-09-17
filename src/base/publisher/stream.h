@@ -137,6 +137,10 @@ namespace pub
 		virtual void SendDataFrame(const std::shared_ptr<MediaPacket> &media_packet) = 0;
 		virtual void OnEvent(const std::shared_ptr<MediaEvent> &event) {}
 
+		// SegmentCache idle playhead advanced (ScheduledChannel). LLHLS overrides to
+		// rebuild the live-edge chunklist and wake CAN-BLOCK-RELOAD waiters.
+		virtual void OnSegmentCachePlayheadTick() {}
+
 		// Track the version of the packet at this stream's consumption position.
 		// Called by pub::Application before Send*Frame; fires OnTrackChanged on a version change.
 		void UpdateTrackFromPacket(const std::shared_ptr<MediaPacket> &media_packet);

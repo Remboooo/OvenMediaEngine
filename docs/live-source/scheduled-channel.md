@@ -114,7 +114,86 @@ Both 'start' and 'duration' are optional. If not set, `start` defaults to 0, and
 
 #### Supported Formats for File Live
 
-<table><thead><tr><th width="290">Title</th><th>Description</th></tr></thead><tbody><tr><td>Formats</td><td><p>MP4, TS, MP3, and more.</p><ul><li>All formats supported by FFmpeg are supported.</li></ul></td></tr></tbody></table>
+<table><thead><tr><th width="290">Title</th><th>Description</th></tr></thead><tbody><tr><td>Formats</td><td><p>MP4, TS, MP3, and more.</p><ul><li>All formats supported by FFmpeg are supported for normal Scheduled Channel playback.</li></ul></td></tr></tbody></table>
+
+## Segment Cache
+
+Optional under `Providers/Schedule`. When enabled, eligible looping `file://` items can stop the demux media pump while still serving HLS and LLHLS from a sample index (segments are remuxed on demand from the MP4). WebRTC / OVT viewers keep the demux pump running.
+
+:::warning H.264 + AAC MP4 only (per file)
+SegmentCache does **not** transcode. It applies only to `file://` items that are **H.264** (+ **AAC** if `AudioTrack` is true) in **MP4/MOV**, and only when `BypassTranscoder=true` and `VideoTrack=true`. Other codecs/containers, or those stream settings, log a warning and **fall back to normal demux** — the schedule still loads. Invalid `SegmentCache` enums or out-of-range values fail Server.xml load.
+:::
+
+```xml
+<!-- /Server/VirtualHosts/VirtualHost/Applications/Application/Providers -->
+<Schedule>
+    <MediaRootDir>/opt/ovenmediaengine/media</MediaRootDir>
+    <ScheduleFilesDir>/opt/ovenmediaengine/media</ScheduleFilesDir>
+    <SegmentCache>
+        <Enable>true</Enable>
+        <Mode>persist</Mode> <!-- persist | memory -->
+        <Hydrate>
+            <Mode>greedy</Mode> <!-- lazy | greedy -->
+            <MaxThreads>2</MaxThreads>
+            <MaxThroughputMbps>50</MaxThroughputMbps> <!-- 0 = unlimited -->
+        </Hydrate>
+        <IdleGracePeriodMs>30000</IdleGracePeriodMs>
+    </SegmentCache>
+</Schedule>
+```
+
+`<SegmentCache> (optional)`\
+Enables the segment cache for this application's Schedule Provider. Omit the whole element (or leave `Enable` false) to keep the classic always-on demux path.
+
+`<SegmentCache>/<Enable> (optional, default: false)`\
+Master switch. When `false`, SegmentCache is off for all streams unless a `.sch` file explicitly enables it (see below). When `true`, eligible `file://` items are indexed and can idle-serve HLS/LLHLS without demux.
+
+`<SegmentCache>/<Mode> (optional, default: persist)`\
+How the sample index is stored after the first build:
+
+- `persist` — write a sidecar next to the media file (e.g. `clip.mp4.ome-segcache…`). Reuses the sidecar on later starts when the source and packager fingerprint still match.
+- `memory` — keep the index in RAM only for this process lifetime; rebuild after every restart.
+
+Invalid values fail Server.xml load.
+
+`<SegmentCache>/<Hydrate> (optional)`\
+Controls how segment bytes are pre-materialized into the hot cache after indexing.
+
+`<SegmentCache>/<Hydrate>/<Mode> (optional, default: lazy)`\
+
+- `lazy` — materialize a segment only when a client (or idle playlist sync) first needs it.
+- `greedy` — after indexing, background-materialize the whole plan so later GETs hit memory.
+
+Invalid values fail Server.xml load.
+
+`<SegmentCache>/<Hydrate>/<MaxThreads> (optional, default: 1)`\
+Worker threads used for greedy hydrate (and shared index/materialize throughput work). Allowed range: **1–64**. Out of range fails Server.xml load.
+
+`<SegmentCache>/<Hydrate>/<MaxThroughputMbps> (optional, default: 0)`\
+Soft cap on aggregate sample-index build + hydrate throughput across workers, in megabits per second. `0` means unlimited. Negative values fail Server.xml load.
+
+`<SegmentCache>/<IdleGracePeriodMs> (optional, default: 30000)`\
+When SegmentCache is active and there are **no** WebRTC/OVT sessions, HLS/LLHLS alone do not keep the demux pump running. If the pump is already running and demand drops to zero, OvenMediaEngine keeps pumping for this many milliseconds before entering idle cache playback (avoids thrashing on brief viewer gaps). `0` means leave idle as soon as demand is zero. Allowed range: **0–600000**. Out of range fails Server.xml load.
+
+### Per-stream override in `.sch`
+
+Omit `<Stream>/<SegmentCache>` to inherit Server.xml. To force on or off for one channel:
+
+```xml
+<Stream>
+    <Name>_filler</Name>
+    <BypassTranscoder>true</BypassTranscoder>
+    <VideoTrack>true</VideoTrack>
+    <AudioTrack>true</AudioTrack>
+    <SegmentCache>
+        <Enable>true</Enable>
+    </SegmentCache>
+</Stream>
+```
+
+`<SegmentCache>true</SegmentCache>` (boolean text) is also accepted. Mode, Hydrate, and IdleGracePeriodMs always come from Server.xml — the `.sch` override is enable/disable only.
+
+`stream://` items in the same schedule are never cached; only matching `file://` items use the cache.
 
 ## Multiple Audio Track
 

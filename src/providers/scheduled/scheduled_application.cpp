@@ -14,8 +14,30 @@
 
 #include <base/ovlibrary/files.h>
 
+#include <cstdlib>
+#include <cstring>
+#include <strings.h>
+
 namespace pvd
 {
+	namespace
+	{
+		bool EnvSegmentCacheEnabled()
+		{
+			const char *env = ::getenv("OME_SEGMENT_CACHE");
+			if (env == nullptr || env[0] == '\0')
+			{
+				return false;
+			}
+			if (std::strcmp(env, "0") == 0 || strcasecmp(env, "false") == 0 ||
+				strcasecmp(env, "off") == 0)
+			{
+				return false;
+			}
+			return true;
+		}
+	}  // namespace
+
     // Implementation of ScheduledApplication
     std::shared_ptr<ScheduledApplication> ScheduledApplication::Create(const std::shared_ptr<Provider> &provider, const info::Application &application_info)
     {
@@ -209,6 +231,26 @@ namespace pvd
             logte("Failed to add schedule (Could not create schedule): %s - %s", schedule_file_info._file_path.CStr(), msg.CStr());
             return false;
         }
+
+		const auto &stream_cfg = schedule->GetStream();
+		const auto &segment_cache_cfg = GetConfig().GetProviders().GetScheduledProvider().GetSegmentCache();
+		const bool segment_cache_wanted =
+			stream_cfg._segment_cache_enable.value_or(segment_cache_cfg.IsEnable() || EnvSegmentCacheEnabled());
+		// SegmentCache is a Server.xml concern; .sch files have separate lifetimes.
+		// Incompatible stream flags or media → warn and fall back to demux at play time
+		// (do not reject the schedule).
+		if (segment_cache_wanted && stream_cfg._bypass_transcoder == false)
+		{
+			logtw("Schedule %s: SegmentCache is enabled but BypassTranscoder=false — "
+				  "cache will be skipped for this stream (demux/transcode path)",
+				  schedule_file_info._file_path.CStr());
+		}
+		if (segment_cache_wanted && stream_cfg._video_track == false)
+		{
+			logtw("Schedule %s: SegmentCache is enabled but VideoTrack=false — "
+				  "cache will be skipped for this stream",
+				  schedule_file_info._file_path.CStr());
+		}
 
         // Create Stream
         auto stream_info = info::Stream(*this, IssueUniqueStreamId(), StreamSourceType::Scheduled);

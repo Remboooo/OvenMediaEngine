@@ -8,6 +8,7 @@ ome_add_static_library(hls_publisher
         http
         monitoring
         ovlibrary
+        segment_cache
 )
 
 if(OME_BUILD_TESTS)

@@ -117,6 +117,11 @@ void LLHlsChunklist::SetPartHoldBack(const float &part_hold_back)
 	_part_hold_back = part_hold_back;
 }
 
+void LLHlsChunklist::SetPartTargetDuration(double part_target_duration)
+{
+	_part_target_duration = part_target_duration;
+}
+
 bool LLHlsChunklist::CreateSegmentInfo(const SegmentInfo &info)
 {
 	logtt("UpdateSegmentInfo[Track : %s/%s]: %s", _track->GetPublicName().CStr(), _track->GetVariantName().CStr(), info.ToString().CStr());
@@ -328,6 +333,30 @@ bool LLHlsChunklist::RemoveSegmentInfo(uint32_t segment_sequence)
 	_segments.erase(segment_sequence);
 
 	return true;
+}
+
+void LLHlsChunklist::ClearAllSegmentInfo()
+{
+	{
+		std::unique_lock<std::shared_mutex> lock(_segments_guard);
+		_segments.clear();
+		_old_segments.clear();
+		_last_completed_segment_sequence = -1;
+		_last_segment_sequence = -1;
+		_last_partial_segment_sequence = -1;
+		_upcoming_map_uri.Clear();
+		_first_segment = true;
+	}
+	UpdateCacheForDefaultChunklist();
+}
+
+void LLHlsChunklist::SetPreloadHintEnabled(bool enabled)
+{
+	{
+		std::lock_guard<std::shared_mutex> lock(_segments_guard);
+		_preload_hint_enabled = enabled;
+	}
+	UpdateCacheForDefaultChunklist();
 }
 
 void LLHlsChunklist::UpdateCacheForDefaultChunklist()
