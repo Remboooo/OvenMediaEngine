@@ -162,11 +162,11 @@ namespace mpegts
 		uint32_t _metadata_application_format_identifier = 0x49443320;	// "ID3 "
 		uint8_t _metadata_format = 0xFF;
 		uint32_t _metadata_format_identifier = 0x49443320;	// "ID3 "
-		uint8_t _metadata_service_id;						// typically 0
-		uint8_t _metadata_locator_record_flag;				// 1 bit : only 0 supported
-		uint8_t _mpeg_carriage_flag;						// 2 bit, only 0 supported
-		uint8_t _reserved;									// 5 bit, 0x1f
-		uint8_t _program_number;							// program number of the program whose es descriptor loop contains the metadata_descriptor
+		uint8_t _metadata_service_id = 0;						// typically 0
+		uint8_t _metadata_locator_record_flag = 0;				// 1 bit : only 0 supported
+		uint8_t _mpeg_carriage_flag = 0;						// 2 bit, only 0 supported
+		uint8_t _reserved = 0x1f;								// 5 bit, 0x1f
+		uint8_t _program_number = 0;							// program number of the program whose es descriptor loop contains the metadata_descriptor
 
 		std::shared_ptr<const ov::Data> _private_data;
 	};

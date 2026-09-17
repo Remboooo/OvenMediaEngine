@@ -5,6 +5,7 @@ ome_add_static_library(scheduled_provider
         mediarouter
         orchestrator
         ovlibrary
+        segment_cache
         task_pool
 )
 

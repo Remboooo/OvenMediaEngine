@@ -23,6 +23,7 @@
 #include <modules/dump/dump.h>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <shared_mutex>
 
 // max initial media packet buffer size, for OOM protection
@@ -87,6 +88,13 @@ private:
 	ov::String GetVariantName(const ov::String &video_variant_name, int video_index, const ov::String &audio_variant_name, int audio_index) const;
 	ov::String GetMediaPlaylistName(const ov::String &variant_name) const;
 	ov::String GetSegmentName(const ov::String &variant_name, uint32_t number) const;
+
+	// Fill playlist from IdlePlaylistDriver when segment cache serves.
+	bool SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const std::shared_ptr<HlsMediaPlaylist> &playlist);
+	// Serializes idle ClearSegments+rebuild vs concurrent playlist GETs.
+	mutable std::mutex _idle_rebuild_mutex;
+	std::map<ov::String, int64_t> _idle_synced_edge_msn;
+	mutable std::mutex _idle_synced_lock;
 
 	std::shared_ptr<mpegts::Packetizer> GetTSPacketizer(const ov::String &variant_name);
 	std::shared_ptr<mpegts::Packager> GetTSPackager(const ov::String &variant_name);

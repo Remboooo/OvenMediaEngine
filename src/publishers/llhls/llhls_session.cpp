@@ -644,7 +644,6 @@ void LLHlsSession::ResponseChunklist(const std::shared_ptr<http::svr::HttpExchan
 		content_encoding = "gzip";
 	}
 
-	// Get the chunklist
 	auto query_string = MakeQueryStringToPropagate(request_uri);
 
 	auto [result, chunklist] = llhls_stream->GetChunklist(query_string, track_id, msn, part, skip, gzip, legacy, rewind);
@@ -1024,7 +1023,7 @@ ov::String LLHlsSession::MakeQueryStringToPropagate(const std::shared_ptr<ov::Ur
 
 	// stream_key is propagated to the child resources
 	ov::String stream_key;
-	if (request_uri->HasQueryKey("stream_key"))
+	if (request_uri != nullptr && request_uri->HasQueryKey("stream_key"))
 	{
 		stream_key = request_uri->GetQueryValue("stream_key");
 	}

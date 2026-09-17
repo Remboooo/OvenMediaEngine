@@ -413,3 +413,22 @@ std::size_t HlsMediaPlaylist::GetSegmentCount() const
 	std::shared_lock<std::shared_mutex> lock(_segments_mutex);
 	return _segments.size();
 }
+
+bool HlsMediaPlaylist::HasSegment(int64_t number) const
+{
+	if (number < 0)
+	{
+		return false;
+	}
+	std::shared_lock<std::shared_mutex> lock(_segments_mutex);
+	return _segments.find(static_cast<uint64_t>(number)) != _segments.end();
+}
+
+void HlsMediaPlaylist::ClearSegments()
+{
+	std::lock_guard<std::shared_mutex> lock(_segments_mutex);
+	_segments.clear();
+	_total_discontinuity_count = 0;
+	_removed_discontinuity_count = 0;
+	_codecs_parameter.Clear();
+}

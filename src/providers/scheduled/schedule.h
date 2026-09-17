@@ -15,6 +15,8 @@
 
 #include <pugixml-1.9/src/pugixml.hpp>
 
+#include <optional>
+
 /*
 <?xml version="1.0" encoding="UTF-8"?>
 <Schedule>
@@ -28,6 +30,8 @@
 		<MaxFallbackDurationMs>60000</MaxFallbackDurationMs> <!-- optional, delete the channel if fallback lasts longer than this, <= 0 : unlimited -->
 		<LiveStartPoint>LatestKeyframe</LiveStartPoint> <!-- optional, LatestKeyframe (default) | NextKeyframe -->
 		<StallToleranceDurationMs>10000</StallToleranceDurationMs> <!-- optional, a file item this far behind or more rejoins the schedule at the current time, <= 0 : always catch up -->
+		<!-- SegmentCache: omit to inherit Server.xml Providers/Schedule/SegmentCache; unsupported media falls back to demux -->
+		<!-- <SegmentCache><Enable>true</Enable></SegmentCache> -->
     </Stream>
 
     <FallbackProgram>
@@ -195,6 +199,10 @@ namespace pvd
 			// A file item this far behind or more rejoins the schedule at the current time, <= 0 : always catch up
 			// Keep it at several seconds, as smaller values also trigger on normal open and seek delays
 			int64_t _stall_tolerance_duration_ms = 10000;
+
+			// Segment cache override from .sch (nullopt = inherit Server.xml Schedule/SegmentCache).
+			// Enabling without BypassTranscoder logs a warning and falls back to demux.
+			std::optional<bool> _segment_cache_enable;
 		};
 
 		class Program
