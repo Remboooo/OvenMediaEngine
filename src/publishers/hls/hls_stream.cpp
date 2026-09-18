@@ -1329,6 +1329,13 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 
 	segment_cache::IdlePlaylistDriver::Config cfg;
 	cfg.window_segments = std::max<size_t>(1, _ts_config.GetSegmentCount());
+	if (GetApplication() != nullptr)
+	{
+		const auto &seg_cache =
+			GetApplication()->GetConfig().GetProviders().GetScheduledProvider().GetSegmentCache();
+		cfg.lookahead_segments =
+			static_cast<size_t>(std::max(0, seg_cache.GetHlsLookaheadSegments()));
+	}
 	segment_cache::IdlePlaylistDriver driver(session, cfg);
 	driver.SetEpochElapsedMs(session->GetElapsedMs());
 
@@ -1338,7 +1345,10 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 		return false;
 	}
 
-	const int64_t edge_msn = window.back().media_sequence;
+	// Edge for rebuild skip is the wall-clock playhead segment, not the
+	// lookahead tip — otherwise mid-segment playlist polls would keep rewriting.
+	const auto playhead = driver.GetPlayhead();
+	const int64_t edge_msn = driver.MediaSequenceForOrdinal(playhead.segment_ordinal);
 	{
 		std::lock_guard<std::mutex> lock(_idle_synced_lock);
 		auto it = _idle_synced_edge_msn.find(variant_name);
@@ -1394,10 +1404,23 @@ std::tuple<HlsStream::RequestResult, std::shared_ptr<const ov::Data>> HlsStream:
 		{
 			auto session = registry.Find(GetName());
 			if (session != nullptr)
-			{
-				// Client GET implies demand — keep the live window hot so HLS does
-				// not stall on cold rematerialize (idle loop does not warm).
-				session->MaybeWarmPlayheadWindow(24, 2000);
+				{
+					// Client GET implies demand — keep the live window hot so HLS does
+					// not stall on cold rematerialize (idle loop does not warm).
+					size_t warm_radius = 24;
+					if (GetApplication() != nullptr)
+					{
+						const auto &seg_cache = GetApplication()
+												   ->GetConfig()
+												   .GetProviders()
+												   .GetScheduledProvider()
+												   .GetSegmentCache();
+						warm_radius = std::max(
+							warm_radius,
+							static_cast<size_t>(_ts_config.GetSegmentCount()) +
+								static_cast<size_t>(std::max(0, seg_cache.GetHlsLookaheadSegments())));
+					}
+					session->MaybeWarmPlayheadWindow(warm_radius, 2000);
 				const size_t plan_size = session->GetPlan().segments.size();
 				if (plan_size > 0)
 				{

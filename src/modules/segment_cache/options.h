@@ -39,6 +39,8 @@ namespace segment_cache
 		CacheMode mode = CacheMode::Off;
 		HydrateOptions hydrate;
 		int64_t idle_grace_period_ms = 30000;
+		// Segments past wall-clock playhead listed in classic HLS idle playlists.
+		size_t hls_lookahead_segments = 0;
 
 		bool IsEnabled() const { return mode != CacheMode::Off; }
 		bool PersistSidecar() const { return mode == CacheMode::Persist; }

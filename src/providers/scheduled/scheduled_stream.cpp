@@ -251,6 +251,8 @@ namespace pvd
 		}
 
 		options.idle_grace_period_ms = cfg_cache.GetIdleGracePeriodMs();
+		options.hls_lookahead_segments =
+			static_cast<size_t>(std::max(0, cfg_cache.GetHlsLookaheadSegments()));
 
 		const auto &hydrate = cfg_cache.GetHydrate();
 		options.hydrate.mode = hydrate.IsGreedy() ? segment_cache::HydrateMode::Greedy
