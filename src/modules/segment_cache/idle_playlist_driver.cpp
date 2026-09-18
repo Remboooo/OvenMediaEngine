@@ -114,16 +114,19 @@ namespace segment_cache
 		_window.assign(newest_first.rbegin(), newest_first.rend());
 
 		// Optional forward walk past the playhead (scheduled HLS buffer-ahead).
+		// Do NOT cross into the next file loop: advertising EXT-X-DISCONTINUITY
+		// and next-loop segments before wall-clock wrap lets players consume the
+		// wrap early, then stall when the tip freezes until the real playhead
+		// catches up. Mid-file lookahead is enough for join-depth alignment.
 		Cursor fwd{static_cast<int64_t>(_playhead.loop_count),
 				   static_cast<int64_t>(_playhead.segment_ordinal)};
 		for (size_t i = 0; i < _config.lookahead_segments; i++)
 		{
-			fwd.ord++;
-			if (fwd.ord >= static_cast<int64_t>(n))
+			if (fwd.ord + 1 >= static_cast<int64_t>(n))
 			{
-				fwd.ord = 0;
-				fwd.loop++;
+				break;
 			}
+			fwd.ord++;
 			_window.push_back(MakeEntry(fwd));
 		}
 

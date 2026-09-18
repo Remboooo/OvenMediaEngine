@@ -11,6 +11,7 @@
 #include "hls_private.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <base/modules/data_format/cue_event/cue_event.h>
 
@@ -433,6 +434,16 @@ void HlsMediaPlaylist::ClearSegments()
 	_codecs_parameter.Clear();
 }
 
+void HlsMediaPlaylist::SetTargetDuration(size_t target_duration_sec)
+{
+	if (target_duration_sec == 0)
+	{
+		target_duration_sec = 1;
+	}
+	std::lock_guard<std::shared_mutex> lock(_segments_mutex);
+	_config.target_duration = target_duration_sec;
+}
+
 void HlsMediaPlaylist::ReplaceIdleWindow(
 	const std::vector<std::shared_ptr<base::modules::Segment>> &segments,
 	int64_t disc_sequence_before_first)
@@ -442,12 +453,33 @@ void HlsMediaPlaylist::ReplaceIdleWindow(
 		disc_sequence_before_first = 0;
 	}
 
+	// RFC 8216: TARGETDURATION must be >= max EXTINF rounded to nearest integer.
+	// Use ceil so undersized config (e.g. HLS SegmentDuration=5 with a 6s LLHLS
+	// cache plan) cannot advertise TD below real segment length — that makes
+	// hls.js reload the playlist too aggressively and briefly stall.
+	size_t required_td = _config.target_duration;
+	for (const auto &segment : segments)
+	{
+		if (segment == nullptr)
+		{
+			continue;
+		}
+		const double dur_s = segment->GetDurationMs() / 1000.0;
+		if (dur_s > 0)
+		{
+			required_td = std::max(required_td, static_cast<size_t>(std::ceil(dur_s - 1e-9)));
+		}
+	}
+
 	{
 		std::lock_guard<std::shared_mutex> lock(_segments_mutex);
 		_segments.clear();
 		_codecs_parameter.Clear();
 		_removed_discontinuity_count = disc_sequence_before_first;
 		_total_discontinuity_count = disc_sequence_before_first;
+		_config.target_duration = std::max<size_t>(1, required_td);
+		// Advertise the full idle window (history + lookahead), not just SegmentCount.
+		_config.segment_count = std::max(_config.segment_count, segments.size());
 	}
 
 	for (const auto &segment : segments)

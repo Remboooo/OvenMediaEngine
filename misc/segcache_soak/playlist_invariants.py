@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -50,7 +51,8 @@ class PlaylistSnap:
 	has_discontinuity_tag: bool
 	pdts: List[float]  # epoch seconds from PROGRAM-DATE-TIME, aligned to listed segs
 	seg_urls: List[str]
-	raw: str
+	extinf_durations: List[float] = field(default_factory=list)
+	raw: str = ""
 
 
 _RE_MSN = re.compile(r"#EXT-X-MEDIA-SEQUENCE:(\d+)")
@@ -95,6 +97,7 @@ def parse_media_playlist(url: str, body: str) -> Optional[PlaylistSnap]:
 
 	pdts: List[float] = []
 	seg_urls: List[str] = []
+	extinf_durations: List[float] = []
 	has_disc = False
 	pending_pdt: Optional[float] = None
 
@@ -106,6 +109,13 @@ def parse_media_playlist(url: str, body: str) -> Optional[PlaylistSnap]:
 		m = _RE_PDT.match(line)
 		if m:
 			pending_pdt = parse_iso8601(m.group(1))
+			continue
+		inf = _RE_INF.match(line)
+		if inf:
+			try:
+				extinf_durations.append(float(inf.group(1)))
+			except ValueError:
+				pass
 			continue
 		if line.startswith("#"):
 			continue
@@ -128,6 +138,7 @@ def parse_media_playlist(url: str, body: str) -> Optional[PlaylistSnap]:
 		has_discontinuity_tag=has_disc,
 		pdts=pdts,
 		seg_urls=seg_urls,
+		extinf_durations=extinf_durations,
 		raw=body,
 	)
 
@@ -228,6 +239,16 @@ def check_snap(
 			)
 	else:
 		tr.window_collapse_streak = 0
+
+	# TARGETDURATION must cover max EXTINF (undersized TD → hls.js early reload/stall)
+	if snap.extinf_durations and snap.target_duration > 0:
+		max_ext = max(snap.extinf_durations)
+		need = int(math.ceil(max_ext - 1e-9))
+		if snap.target_duration < need:
+			tr.fail(
+				f"TARGETDURATION={snap.target_duration} < ceil(max EXTINF={max_ext:.3f})={need} "
+				f"(msn={snap.media_sequence})"
+			)
 
 
 def main() -> int:

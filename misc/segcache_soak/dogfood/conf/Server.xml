@@ -126,8 +126,9 @@
 							</CrossDomains>
 						</LLHLS>
 						<HLS>
+							<!-- Match LLHLS/cache plan (~6s); idle path also raises TARGETDURATION to ceil(max EXTINF) -->
 							<SegmentCount>6</SegmentCount>
-							<SegmentDuration>5</SegmentDuration>
+							<SegmentDuration>6</SegmentDuration>
 							<CrossDomains>
 								<Url>*</Url>
 							</CrossDomains>

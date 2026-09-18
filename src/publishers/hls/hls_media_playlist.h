@@ -76,8 +76,12 @@ public:
 	// Replace the live window for SegmentCache idle serve. Sets
 	// EXT-X-DISCONTINUITY-SEQUENCE accounting from disc_sequence_before_first
 	// (wraps that fully precede the first listed segment) instead of wiping it.
+	// Raises TARGETDURATION to cover the longest EXTINF (RFC 8216) so players
+	// do not reload/rebuffer when the cache plan exceeds configured SegmentDuration.
 	void ReplaceIdleWindow(const std::vector<std::shared_ptr<base::modules::Segment>> &segments,
 						   int64_t disc_sequence_before_first);
+
+	void SetTargetDuration(size_t target_duration_sec);
 
 private:
 	// Recompute the cached CODECS union. Caller must hold _segments_mutex exclusively.

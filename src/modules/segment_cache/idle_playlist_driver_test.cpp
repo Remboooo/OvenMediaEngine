@@ -211,7 +211,7 @@ TEST(SegmentCacheIdlePlaylist, LookaheadExtendsPastPlayhead)
 	EXPECT_EQ(window[0].media_sequence, driver.MediaSequenceForOrdinal(0));
 }
 
-TEST(SegmentCacheIdlePlaylist, LookaheadWrapsIntoNextLoop)
+TEST(SegmentCacheIdlePlaylist, LookaheadStopsAtLoopBoundary)
 {
 	ov::String fixture = "/tmp/ome_segcache_fixture.mp4";
 	ASSERT_TRUE(EnsureTinyFixture(fixture));
@@ -228,10 +228,11 @@ TEST(SegmentCacheIdlePlaylist, LookaheadWrapsIntoNextLoop)
 
 	segment_cache::IdlePlaylistDriver::Config cfg;
 	cfg.window_segments = 1;
-	cfg.lookahead_segments = 1;
+	cfg.lookahead_segments = 3;
 	segment_cache::IdlePlaylistDriver driver(session, cfg);
 
-	// Park on the last segment of loop 0 so lookahead crosses the wrap.
+	// Park on the last segment of loop 0 — lookahead must not invent next-loop
+	// MSNs / EXT-X-DISCONTINUITY before wall-clock wrap.
 	const auto &last = session->GetPlan().segments.back();
 	const int64_t origin = session->GetPlan().segments.front().start_dts;
 	const int64_t pos_ms = (last.start_dts - origin) / 90 + 10;
@@ -240,9 +241,30 @@ TEST(SegmentCacheIdlePlaylist, LookaheadWrapsIntoNextLoop)
 	EXPECT_EQ(driver.GetPlayhead().segment_ordinal, plan_size - 1);
 
 	const auto &window = driver.GetWindow();
-	ASSERT_EQ(window.size(), 2u);
+	ASSERT_EQ(window.size(), 1u);
 	EXPECT_EQ(window.front().media_sequence, static_cast<int64_t>(plan_size - 1));
-	EXPECT_EQ(window.back().media_sequence, static_cast<int64_t>(plan_size));
-	EXPECT_EQ(window.back().plan_ordinal, 0u);
-	EXPECT_TRUE(window.back().discontinuity);
+	EXPECT_FALSE(window.front().discontinuity);
+	EXPECT_EQ(window.back().media_sequence, static_cast<int64_t>(plan_size - 1));
+
+	// After wall-clock wrap, history may bridge; lookahead stays within the new loop.
+	const int64_t item_ms = session->GetItemDurationMs();
+	driver.SetEpochElapsedMs(item_ms + 50);
+	EXPECT_EQ(driver.GetPlayhead().loop_count, 1u);
+	EXPECT_EQ(driver.GetPlayhead().segment_ordinal, 0u);
+
+	cfg.window_segments = 2;
+	cfg.lookahead_segments = 2;
+	segment_cache::IdlePlaylistDriver after(session, cfg);
+	after.SetEpochElapsedMs(item_ms + 50);
+	const auto &w2 = after.GetWindow();
+	ASSERT_GE(w2.size(), 2u);
+	EXPECT_EQ(w2.back().media_sequence, static_cast<int64_t>(plan_size) + 2);
+	EXPECT_LT(w2.back().plan_ordinal, plan_size);
+	for (const auto &e : w2)
+	{
+		if (e.media_sequence > static_cast<int64_t>(plan_size))
+		{
+			EXPECT_FALSE(e.discontinuity) << "msn=" << e.media_sequence;
+		}
+	}
 }

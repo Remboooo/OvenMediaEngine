@@ -542,6 +542,27 @@ TEST_F(HlsMediaPlaylistTest, ReplaceIdleWindowKeepsDiscontinuitySequenceMonotoni
 	EXPECT_NE(after2.IndexOf("#EXT-X-DISCONTINUITY-SEQUENCE:2"), -1L);
 }
 
+TEST_F(HlsMediaPlaylistTest, ReplaceIdleWindowRaisesTargetDurationToCoverExtinf)
+{
+	// Configured TD=5 with 6400ms segments (LLHLS plan / keyframe snap) must
+	// advertise TARGETDURATION >= 7 so hls.js does not reload/stall early.
+	HlsMediaPlaylist::HlsMediaPlaylistConfig config;
+	config.segment_count = 6;
+	config.target_duration = 5;
+	auto playlist = std::make_shared<HlsMediaPlaylist>("v", "medialist.m3u8", config);
+
+	std::vector<std::shared_ptr<base::modules::Segment>> segs;
+	for (int i = 0; i < 3; i++)
+	{
+		segs.push_back(MakeSegment(i, i * 576000, 6400, 0, false, "avc1.640028"));
+	}
+	playlist->ReplaceIdleWindow(segs, 0);
+
+	auto body = playlist->ToString(true);
+	EXPECT_NE(body.IndexOf("#EXT-X-TARGETDURATION:7"), -1L) << body.CStr();
+	EXPECT_EQ(body.IndexOf("#EXT-X-TARGETDURATION:5"), -1L);
+}
+
 TEST_F(HlsMediaPlaylistTest, ExcludedFlag)
 {
 	auto playlist = MakePlaylist();

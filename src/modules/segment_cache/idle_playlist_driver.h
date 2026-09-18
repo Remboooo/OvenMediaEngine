@@ -52,6 +52,7 @@ namespace segment_cache
 			size_t window_segments = 3;
 			// Extra segments past the playhead (classic HLS only). Future media is
 			// deterministic under SegmentCache; 0 keeps the edge at the playhead.
+			// Lookahead never crosses a file-loop boundary (avoids early wrap disc).
 			size_t lookahead_segments = 0;
 		};
 

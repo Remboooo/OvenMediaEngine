@@ -180,7 +180,20 @@ Soft cap on aggregate sample-index build + hydrate throughput across workers, in
 When SegmentCache is active and there are **no** WebRTC/OVT sessions, HLS/LLHLS alone do not keep the demux pump running. If the pump is already running and demand drops to zero, OvenMediaEngine keeps pumping for this many milliseconds before entering idle cache playback (avoids thrashing on brief viewer gaps). `0` means leave idle as soon as demand is zero. Allowed range: **0–600000**. Out of range fails Server.xml load.
 
 `<SegmentCache>/<HlsLookaheadSegments> (optional, default: 0)`\
-Classic HLS only. When SegmentCache idle-serves a scheduled `file://` item, the media playlist normally ends at the wall-clock playhead. Classic HLS players typically start **2–3 segments behind** that edge, so they run ~10s+ behind LLHLS on the same schedule. Set this to the number of **future** segments to advertise past the playhead (media is already on disk). Players that still join near `edge − 3` then land near schedule / LLHLS time. `0` keeps the previous behavior. LLHLS chunklists stay edge-accurate (parts only up to now). Allowed range: **0–100**. Out of range fails Server.xml load. A value around **2–3** matches typical HLS join depth for common segment durations.
+:::warning Experimental (not on mainline by default)
+This knob lives on branch `feat/segcache-hls-lookahead`. It is **not** considered production-ready: classic HLS join depth vs a shared schedule clock is a hard trade-off, and cross-loop lookahead previously caused tip-chase stalls at file wrap.
+:::
+
+Classic HLS only. When SegmentCache idle-serves a scheduled `file://` item, the media playlist normally ends at the wall-clock **schedule playhead** (“what’s on air now”). Classic HLS players typically start **2–3 segments behind** that edge, so they run ~10s+ behind LLHLS on the same schedule. `HlsLookaheadSegments` lists that many **future** segments past the playhead (bytes are real; they are already on disk) so a behind-the-edge join lands nearer LLHLS time.
+
+**Caveats**
+
+- The live tip must not run ahead of the schedule clock for longer than the player’s buffer, or tip-chasers stall when the playlist stops growing until wall time catches up.
+- Lookahead therefore **stops at the end of the current file loop** (no early `#EXT-X-DISCONTINUITY` / next-loop segments). At EOF the forward buffer can shrink; wrap is safer but not as seamless as mid-file lookahead.
+- Idle playlists also raise `#EXT-X-TARGETDURATION` to `ceil(max EXTINF)` when the cache plan exceeds configured `<HLS><SegmentDuration>` (otherwise undersized TD causes early playlist reloads / brief stalls).
+- LLHLS stays edge/part-accurate and ignores this knob.
+
+`0` = off. Allowed range: **0–100**. Out of range fails Server.xml load. Try **2–3** only on the feature branch / dogfood.
 
 ### Per-stream override in `.sch`
 
