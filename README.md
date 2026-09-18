@@ -1,14 +1,15 @@
-# OvenMediaEngine
+# OvenMediaEngine (fork)
 
-[![GitHub release](https://img.shields.io/github/v/release/OvenMediaLabs/OvenMediaEngine?color=blue)](https://github.com/OvenMediaLabs/OvenMediaEngine/releases)
-[![License](https://img.shields.io/badge/license-AGPL--3.0-orange)](LICENSE)
-[![Docker Build](https://img.shields.io/github/actions/workflow/status/OvenMediaLabs/OvenMediaEngine/docker-image-release-multi.yml?label=docker%20build)](https://github.com/OvenMediaLabs/OvenMediaEngine/actions/workflows/docker-image-release-multi.yml)
-[![Docs Build](https://img.shields.io/github/actions/workflow/status/OvenMediaLabs/OvenMediaEngine/check-docs-build.yml?label=docs%20build)](https://github.com/OvenMediaLabs/OvenMediaEngine/actions/workflows/check-docs-build.yml)
+This is a personal fork of [OvenMediaEngine](https://github.com/OvenMediaLabs/OvenMediaEngine) / [AirenSoft/OvenMediaEngine](https://github.com/AirenSoft/OvenMediaEngine). For official releases, documentation, and support, use upstream.
 
-[![Docker Pulls (current)](https://img.shields.io/docker/pulls/ovenmedialabs/ovenmediaengine?label=docker%20pulls%20(current)&color=blue)](https://hub.docker.com/r/ovenmedialabs/ovenmediaengine)
-[![Docker Pulls (legacy)](https://img.shields.io/docker/pulls/airensoft/ovenmediaengine?label=docker%20pulls%20(legacy)&color=lightgrey)](https://hub.docker.com/r/airensoft/ovenmediaengine)
+> **Warning:** This fork is **not** nearly as well tested as mainline OvenMediaEngine. It is maintained like a hobby project — expect rough edges, limited review, and no production support guarantees. Use at your own risk.
 
-> **Fork notice:** This is an **unsupported, poorly maintained** fork of [OvenMediaEngine](https://github.com/AirenSoft/OvenMediaEngine). It attempts to keep **NVIDIA NVENC/NVDEC** hardware transcoding working on **OME 0.21.0 and later**. For official releases, documentation, and support, use the upstream project.
+## What this fork adds
+
+* **NVIDIA NVENC / NVDEC** — restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
+* **Scheduled Channel SegmentCache** — for bypass `file://` H.264+AAC MP4 items, indexes samples and can idle-serve HLS/LLHLS without keeping the demux media pump running (near-zero media disk I/O with no WebRTC/OVT viewers). Configure under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
+
+Everything else follows upstream OvenMediaEngine unless noted in the commits on this branch.
 
 ## What is OvenMediaEngine?
 <img src="dist/OME_LLHLS_220610.svg" style="max-width: 100%; height: auto;">
