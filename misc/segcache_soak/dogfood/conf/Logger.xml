@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Logger version="2">
+	<Path>/mnt/zfs/rem/dev/OvenMediaEngine/misc/segcache_soak/dogfood/logs</Path>
+	<Tag name="SRT" level="critical" />
+	<Tag name="HttpServer" level="warn" />
+	<Tag name=".*\.Stat" level="warn" />
+	<Tag name="Transcoder" level="warn" />
+	<!-- Dogfood: SegmentCache/Scheduled visible; mute per-segment hydrate spam -->
+	<Tag name="SegmentCache.MpegTs" level="warn" />
+	<Tag name="SegmentCache.Fmp4" level="warn" />
+	<Tag name="SegmentCache.*" level="info" />
+	<Tag name="Scheduled.*" level="info" />
+	<Tag name="ScheduledChannel Provider" level="info" />
+	<Tag name="LLHls.*" level="info" />
+	<Tag name="Hls.*" level="warn" />
+	<Tag name=".*" level="warn" />
+</Logger>

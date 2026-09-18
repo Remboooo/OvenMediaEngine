@@ -19,7 +19,26 @@ namespace segment_cache
 		int64_t end_dts = 0;
 		double duration_ms = 0;
 		size_t part_count = 0;
+		// True when this entry is the first segment of loop k>=1 (file wrap).
+		bool discontinuity = false;
 	};
+
+	// Wrap discontinuities sit at media_sequence = k * plan_size for k >= 1.
+	// EXT-X-DISCONTINUITY-SEQUENCE is the count of those with msn < first_msn.
+	inline int64_t WrapDiscontinuitySequenceBefore(int64_t first_media_sequence, size_t plan_size)
+	{
+		if (plan_size == 0 || first_media_sequence <= 0)
+		{
+			return 0;
+		}
+		return (first_media_sequence - 1) / static_cast<int64_t>(plan_size);
+	}
+
+	inline bool IsWrapDiscontinuity(int64_t media_sequence, size_t plan_ordinal, size_t plan_size)
+	{
+		return plan_size > 0 && plan_ordinal == 0 &&
+			   media_sequence >= static_cast<int64_t>(plan_size);
+	}
 
 	// Advances a sliding playlist window from wall-clock elapsed time alone.
 	// No demux / no packager — used to prove idle HLS/LLHLS playlist motion.

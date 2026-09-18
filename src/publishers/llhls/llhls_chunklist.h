@@ -297,6 +297,8 @@ public:
 	bool RemoveSegmentInfo(uint32_t segment_sequence);
 	// Drop every listed segment (used when switching to idle cache playlists).
 	void ClearAllSegmentInfo();
+	// ClearAllSegmentInfo + seed EXT-X-DISCONTINUITY-SEQUENCE for idle wrap serve.
+	void PrepareIdleWindow(int64_t disc_sequence_before_first);
 
 	void SetPreloadHintEnabled(bool enabled);
 

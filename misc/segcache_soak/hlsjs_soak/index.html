@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OME hls.js soak</title>
+  <style>
+    html, body { margin: 0; background: #111; color: #ddd; font: 14px/1.4 monospace; }
+    video { width: 640px; max-width: 100%; background: #000; }
+    #log { white-space: pre-wrap; padding: 8px; max-height: 40vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <video id="video" controls muted autoplay playsinline></video>
+  <div id="log"></div>
+  <script type="module">
+    import Hls from './node_modules/hls.js/dist/hls.mjs';
+
+    const params = new URLSearchParams(location.search);
+    const src = params.get('src');
+    const logEl = document.getElementById('log');
+    const video = document.getElementById('video');
+
+    const state = {
+      ready: false,
+      fatal: null,
+      errors: [],
+      lastMediaSeq: null,
+      lastDiscSeq: null,
+      discSeqHistory: [],
+      msnHistory: [],
+      windowSizes: [],
+      currentTime: 0,
+      bufferedEnd: 0,
+      stallMs: 0,
+      lastAdvanceAt: Date.now(),
+    };
+    window.__OME_SOAK__ = state;
+
+    function log(line) {
+      const ts = new Date().toISOString().slice(11, 23);
+      logEl.textContent += `[${ts}] ${line}\n`;
+      console.log(line);
+    }
+
+    if (!src) {
+      state.fatal = 'missing ?src=';
+      log(state.fatal);
+      throw new Error(state.fatal);
+    }
+
+    if (!Hls.isSupported()) {
+      state.fatal = 'hls.js not supported in this browser';
+      log(state.fatal);
+      throw new Error(state.fatal);
+    }
+
+    const hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      // Live edge chase similar to a long-lived tab
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 10,
+    });
+    window.__OME_HLS__ = hls;
+
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      const entry = {
+        t: Date.now(),
+        type: data.type,
+        details: data.details,
+        fatal: !!data.fatal,
+      };
+      state.errors.push(entry);
+      log(`ERROR fatal=${entry.fatal} type=${entry.type} details=${entry.details}`);
+      if (data.fatal) {
+        state.fatal = `${data.type}:${data.details}`;
+        try {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            hls.startLoad();
+          } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            hls.destroy();
+          }
+        } catch (e) {
+          log(`recover failed: ${e}`);
+        }
+      }
+    });
+
+    hls.on(Hls.Events.LEVEL_LOADED, (_, data) => {
+      const details = data.details;
+      if (!details) return;
+      const msn = details.startSN;
+      const disc = details.discontinuityStarts?.length
+        ? (details.discontinuitySequence ?? null)
+        : (details.discontinuitySequence ?? null);
+      // hls.js exposes discontinuitySequence on level details when present
+      const discSeq =
+        typeof details.discontinuitySequence === 'number'
+          ? details.discontinuitySequence
+          : null;
+      const segs = details.fragments?.length ?? 0;
+
+      state.lastMediaSeq = msn;
+      state.lastDiscSeq = discSeq;
+      state.msnHistory.push({ t: Date.now(), msn, segs, discSeq });
+      state.discSeqHistory.push({ t: Date.now(), discSeq, hasDiscTag: (details.fragmentTagCount ?? 0) });
+      state.windowSizes.push({ t: Date.now(), segs });
+
+      // Detect DISC-SEQ vanish / decrease client-side too
+      const prev = state.msnHistory.length >= 2 ? state.msnHistory[state.msnHistory.length - 2] : null;
+      if (prev && prev.discSeq != null && discSeq == null) {
+        state.fatal = state.fatal || `disc_seq_vanished:prev=${prev.discSeq}`;
+        log(`INVARIANT disc_seq vanished (was ${prev.discSeq})`);
+      }
+      if (prev && prev.discSeq != null && discSeq != null && discSeq < prev.discSeq) {
+        state.fatal = state.fatal || `disc_seq_decreased:${prev.discSeq}->${discSeq}`;
+        log(`INVARIANT disc_seq decreased ${prev.discSeq} -> ${discSeq}`);
+      }
+      if (prev && msn < prev.msn) {
+        state.fatal = state.fatal || `msn_decreased:${prev.msn}->${msn}`;
+        log(`INVARIANT msn decreased ${prev.msn} -> ${msn}`);
+      }
+
+      log(`LEVEL msn=${msn} discSeq=${discSeq ?? '-'} segs=${segs} live=${details.live}`);
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      state.ready = true;
+      video.play().catch((e) => log(`play(): ${e}`));
+    });
+
+    setInterval(() => {
+      state.currentTime = video.currentTime || 0;
+      let end = 0;
+      try {
+        if (video.buffered.length) {
+          end = video.buffered.end(video.buffered.length - 1);
+        }
+      } catch (_) {}
+      state.bufferedEnd = end;
+      if (video.currentTime > (state._lastCt || 0) + 0.05) {
+        state.lastAdvanceAt = Date.now();
+        state._lastCt = video.currentTime;
+      }
+      state.stallMs = Date.now() - state.lastAdvanceAt;
+    }, 500);
+
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    log(`loading ${src}`);
+  </script>
+</body>
+</html>

@@ -14,6 +14,8 @@
 
 #include "hls_media_playlist.h"
 
+#include <modules/segment_cache/idle_playlist_driver.h>
+
 namespace
 {
 	std::shared_ptr<MediaTrack> MakeTrack(uint32_t id, cmn::MediaType type, cmn::MediaCodecId codec, uint32_t version)
@@ -497,6 +499,47 @@ TEST_F(HlsMediaPlaylistTest, NoDiscontinuityWithoutChange)
 
 	auto result = playlist->ToString(true);
 	EXPECT_EQ(result.IndexOf("#EXT-X-DISCONTINUITY"), -1L);
+}
+
+TEST_F(HlsMediaPlaylistTest, ReplaceIdleWindowKeepsDiscontinuitySequenceMonotonic)
+{
+	// Simulates SegmentCache idle rebuilds across a file wrap: ClearSegments used
+	// to zero DISC-SEQ so the tag vanished once the wrap disc scrolled out.
+	auto playlist = MakePlaylist(3);
+	const size_t plan_size = 4;
+
+	auto rebuild = [&](int64_t first_msn, bool include_wrap_disc) {
+		std::vector<std::shared_ptr<base::modules::Segment>> segs;
+		for (int i = 0; i < 3; i++)
+		{
+			const int64_t msn = first_msn + i;
+			const bool disc = include_wrap_disc && (msn == static_cast<int64_t>(plan_size));
+			segs.push_back(MakeSegment(msn, msn * 90000, 6000, 0, disc, "avc1.640028"));
+		}
+		const int64_t disc_seq =
+			segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
+		playlist->ReplaceIdleWindow(segs, disc_seq);
+		return playlist->ToString(true);
+	};
+
+	// Wrap disc listed as first segment of the window (msn=4)
+	auto at_wrap = rebuild(4, true);
+	EXPECT_NE(at_wrap.IndexOf("#EXT-X-DISCONTINUITY\n"), -1L);
+	EXPECT_NE(at_wrap.IndexOf("#EXT-X-DISCONTINUITY-SEQUENCE:0"), -1L);
+
+	// Wrap disc still in window but not first (msn=3..5, disc at 4)
+	auto mid = rebuild(3, true);
+	EXPECT_NE(mid.IndexOf("#EXT-X-DISCONTINUITY\n"), -1L);
+	EXPECT_NE(mid.IndexOf("#EXT-X-DISCONTINUITY-SEQUENCE:0"), -1L);
+
+	// Wrap disc scrolled out (msn=5..7)
+	auto after = rebuild(5, false);
+	EXPECT_EQ(after.IndexOf("#EXT-X-DISCONTINUITY\n"), -1L);
+	EXPECT_NE(after.IndexOf("#EXT-X-DISCONTINUITY-SEQUENCE:1"), -1L);
+
+	// Second wrap scrolls out
+	auto after2 = rebuild(9, false);
+	EXPECT_NE(after2.IndexOf("#EXT-X-DISCONTINUITY-SEQUENCE:2"), -1L);
 }
 
 TEST_F(HlsMediaPlaylistTest, ExcludedFlag)

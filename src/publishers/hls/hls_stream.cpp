@@ -1349,27 +1349,37 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 		_idle_synced_edge_msn[variant_name] = edge_msn;
 	}
 
-	if (playlist->GetWallclockOffset() == INT64_MIN)
-	{
-		playlist->SetWallclockOffset(0);
-	}
+	// Keep wallclock_offset = now - elapsed so PROGRAM-DATE-TIME tracks wall
+	// time across loops (media DTS alone would jump backward on wrap).
+	playlist->SetWallclockOffset(ov::Time::GetTimestampInMs() - session->GetElapsedMs());
 
 	const size_t plan_size = session->GetPlan().segments.size();
+	const int64_t item_ms = std::max<int64_t>(1, session->GetItemDurationMs());
+	const int64_t first_msn = window.front().media_sequence;
+	const int64_t disc_seq =
+		segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
 
-	// Replace packager playlist wholesale when serving from idle cache.
-	playlist->ClearSegments();
+	std::vector<std::shared_ptr<base::modules::Segment>> idle_segments;
+	idle_segments.reserve(window.size());
 
 	for (const auto &entry : window)
 	{
-		auto segment = std::make_shared<mpegts::Segment>(entry.media_sequence, entry.start_dts, entry.duration_ms);
+		const int64_t loop = plan_size > 0
+								 ? entry.media_sequence / static_cast<int64_t>(plan_size)
+								 : 0;
+		// Shift DTS by whole loops so PDT (dts + wallclock_offset) stays monotonic.
+		const int64_t abs_start_dts = entry.start_dts + loop * item_ms * 90;
+		auto segment =
+			std::make_shared<mpegts::Segment>(entry.media_sequence, abs_start_dts, entry.duration_ms);
 		segment->SetUrl(GetSegmentName(variant_name, static_cast<uint32_t>(entry.media_sequence)));
-		if (plan_size > 0 && entry.plan_ordinal == 0 &&
-			entry.media_sequence >= static_cast<int64_t>(plan_size))
+		if (entry.discontinuity)
 		{
 			segment->SetDiscontinuityPoint(true);
 		}
-		playlist->OnSegmentCreated(segment);
+		idle_segments.push_back(segment);
 	}
+
+	playlist->ReplaceIdleWindow(idle_segments, disc_seq);
 
 	return playlist->GetSegmentCount() > 0;
 }
