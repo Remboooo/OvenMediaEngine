@@ -76,25 +76,21 @@ namespace segment_cache
 				   static_cast<int64_t>(_playhead.segment_ordinal)};
 
 		std::vector<IdlePlaylistEntry> newest_first;
-		newest_first.reserve(want + _config.lookahead_segments);
+		newest_first.reserve(want);
 
-		auto MakeEntry = [&](const Cursor &c) {
-			const auto &seg = plan.segments[static_cast<size_t>(c.ord)];
+		for (size_t i = 0; i < want; i++)
+		{
+			const auto &seg = plan.segments[static_cast<size_t>(cur.ord)];
 			IdlePlaylistEntry entry;
-			entry.plan_ordinal = static_cast<size_t>(c.ord);
-			entry.media_sequence = c.loop * static_cast<int64_t>(n) + c.ord;
+			entry.plan_ordinal = static_cast<size_t>(cur.ord);
+			entry.media_sequence = cur.loop * static_cast<int64_t>(n) + cur.ord;
 			entry.start_dts = seg.start_dts;
 			entry.end_dts = seg.end_dts;
 			entry.duration_ms = static_cast<double>(seg.end_dts - seg.start_dts) / 90.0;
 			entry.part_count = seg.parts.size();
 			entry.discontinuity =
 				IsWrapDiscontinuity(entry.media_sequence, entry.plan_ordinal, n);
-			return entry;
-		};
-
-		for (size_t i = 0; i < want; i++)
-		{
-			newest_first.push_back(MakeEntry(cur));
+			newest_first.push_back(entry);
 
 			if (cur.ord > 0)
 			{
@@ -112,21 +108,6 @@ namespace segment_cache
 		}
 
 		_window.assign(newest_first.rbegin(), newest_first.rend());
-
-		// Optional forward walk past the playhead (scheduled HLS buffer-ahead).
-		Cursor fwd{static_cast<int64_t>(_playhead.loop_count),
-				   static_cast<int64_t>(_playhead.segment_ordinal)};
-		for (size_t i = 0; i < _config.lookahead_segments; i++)
-		{
-			fwd.ord++;
-			if (fwd.ord >= static_cast<int64_t>(n))
-			{
-				fwd.ord = 0;
-				fwd.loop++;
-			}
-			_window.push_back(MakeEntry(fwd));
-		}
-
 		if (_window.empty() == false)
 		{
 			_media_sequence_start = _window.front().media_sequence;

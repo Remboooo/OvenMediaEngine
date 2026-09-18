@@ -47,12 +47,7 @@ namespace segment_cache
 	public:
 		struct Config
 		{
-			// How many segments to advertise ending at the wall-clock playhead
-			// (oldest → playhead), walking backward across loop wraps.
-			size_t window_segments = 3;
-			// Extra segments past the playhead (classic HLS only). Future media is
-			// deterministic under SegmentCache; 0 keeps the edge at the playhead.
-			size_t lookahead_segments = 0;
+			size_t window_segments = 3;  // how many completed segments to advertise
 		};
 
 		IdlePlaylistDriver(std::shared_ptr<const SourceSession> session, Config config);

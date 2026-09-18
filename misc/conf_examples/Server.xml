@@ -516,8 +516,6 @@
 									<MaxThroughputMbps>50</MaxThroughputMbps>
 								</Hydrate>
 								<IdleGracePeriodMs>30000</IdleGracePeriodMs>
-								<!-- Classic HLS: list N segments past wall-clock playhead (0 = edge at playhead) -->
-								<HlsLookaheadSegments>3</HlsLookaheadSegments>
 							</SegmentCache>
 							-->
 						</Schedule>
