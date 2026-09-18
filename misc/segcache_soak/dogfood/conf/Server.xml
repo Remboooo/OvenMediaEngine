@@ -105,6 +105,7 @@
 									<MaxThroughputMbps>200</MaxThroughputMbps>
 								</Hydrate>
 								<IdleGracePeriodMs>15000</IdleGracePeriodMs>
+								<HlsLookaheadSegments>3</HlsLookaheadSegments>
 							</SegmentCache>
 						</Schedule>
 					</Providers>

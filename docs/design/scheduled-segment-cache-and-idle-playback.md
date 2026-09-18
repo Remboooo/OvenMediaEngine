@@ -82,7 +82,7 @@ Publisher playlist code holds **keys + durations + sequence numbers**, not owned
 
 - Keep `EXT-X-MEDIA-SEQUENCE` (and part numbers) monotonically increasing across file loops.
 - On wrap, insert discontinuity if the encoded timeline resets.
-- Sliding window length stays as configured (`SegmentCount`); window content is “which virtual keys are visible now,” derived from wall-clock playhead.
+- Sliding window length stays as configured (`SegmentCount`); window content is “which virtual keys are visible now,” derived from wall-clock playhead. Optional `HlsLookaheadSegments` (SegmentCache config) extends classic HLS past the playhead so players that join behind the live edge can align with LLHLS; LLHLS remains edge/part-accurate.
 
 ### Hydration modes
 
@@ -213,6 +213,8 @@ Under `Providers/Schedule`:
       <MaxThroughputMbps>50</MaxThroughputMbps>  <!-- aggregate for index+hydrate; 0 = unlimited -->
     </Hydrate>
     <IdleGracePeriodMs>30000</IdleGracePeriodMs>
+    <!-- Classic HLS: advertise N segments past playhead so join latency ≈ LLHLS -->
+    <HlsLookaheadSegments>3</HlsLookaheadSegments>
   </SegmentCache>
 </Schedule>
 ```
