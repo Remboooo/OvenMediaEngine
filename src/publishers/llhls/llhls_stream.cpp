@@ -1122,17 +1122,20 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 	const size_t plan_size = plan.segments.size();
 	const ov::String map_uri = GetInitializationSegmentName(track_id);
 	const int64_t item_duration_ms = std::max<int64_t>(1, session->GetItemDurationMs());
-	const int64_t position_ms = session->GetElapsedMs() % item_duration_ms;
+	const int64_t elapsed_ms = session->GetElapsedMs();
 	const int64_t now_ms = ov::Time::GetTimestampInMs();
 	const int64_t plan_origin_dts = plan.segments.front().start_dts;
+	const int64_t first_msn = window.front().media_sequence;
+	const int64_t disc_seq =
+		segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
 
 	// Idle playlists are fully deterministic from the cache window. PRELOAD-HINT
 	// would point at the next part and block LL-HLS clients until playhead moves.
 	chunklist->SetPreloadHintEnabled(false);
 
-	// Replace the live packager window entirely. Merging leaves PRELOAD-HINT /
-	// half-open segments behind and freezes MEDIA-SEQUENCE at 0.
-	chunklist->ClearAllSegmentInfo();
+	// Replace the live packager window entirely. Seed DISC-SEQ so wraps that have
+	// scrolled out remain visible to hls.js (ClearAll alone used to wipe/skew it).
+	chunklist->PrepareIdleWindow(disc_seq);
 
 	// PART-TARGET must match real part durations. Cache parts are keyframe-aligned
 	// (often ~1s GOP) even when Server.xml ChunkDuration is smaller (e.g. 0.2s).
@@ -1143,6 +1146,9 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 		const auto &entry = window[wi];
 		const auto seq = static_cast<uint32_t>(entry.media_sequence);
 		const bool is_live_edge = (wi + 1 == window.size());
+		const int64_t loop = plan_size > 0
+								 ? entry.media_sequence / static_cast<int64_t>(plan_size)
+								 : 0;
 
 		chunklist->CreateSegmentInfo(LLHlsChunklist::SegmentInfo(seq, GetSegmentName(track_id, entry.media_sequence)));
 
@@ -1167,7 +1173,9 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 			const double duration_sec = static_cast<double>(part.end_dts - part.start_dts) / 90000.0;
 			max_part_duration_sec = std::max(max_part_duration_sec, duration_sec);
 			const int64_t part_pos_ms = (part.start_dts - plan_origin_dts) / 90;
-			const int64_t start_ms = now_ms - position_ms + part_pos_ms;
+			// Absolute timeline across loops: session wall start + loop*item + in-file.
+			const int64_t start_ms =
+				now_ms - elapsed_ms + loop * item_duration_ms + part_pos_ms;
 			const bool is_last_published = (p + 1 == publish_parts);
 			const bool completes_segment = (is_live_edge == false && is_last_published);
 			const auto part_url = GetPartialSegmentName(track_id, entry.media_sequence, static_cast<int64_t>(p));
@@ -1187,8 +1195,7 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 													part_url, next_url, true /*independent*/, completes_segment);
 			info.SetMapUri(map_uri);
 			info.SetTrackVersion(1);
-			if (plan_size > 0 && entry.plan_ordinal == 0 &&
-				entry.media_sequence >= static_cast<int64_t>(plan_size))
+			if (entry.discontinuity && p == 0)
 			{
 				info.SetDiscontinuity();
 			}

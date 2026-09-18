@@ -432,3 +432,29 @@ void HlsMediaPlaylist::ClearSegments()
 	_removed_discontinuity_count = 0;
 	_codecs_parameter.Clear();
 }
+
+void HlsMediaPlaylist::ReplaceIdleWindow(
+	const std::vector<std::shared_ptr<base::modules::Segment>> &segments,
+	int64_t disc_sequence_before_first)
+{
+	if (disc_sequence_before_first < 0)
+	{
+		disc_sequence_before_first = 0;
+	}
+
+	{
+		std::lock_guard<std::shared_mutex> lock(_segments_mutex);
+		_segments.clear();
+		_codecs_parameter.Clear();
+		_removed_discontinuity_count = disc_sequence_before_first;
+		_total_discontinuity_count = disc_sequence_before_first;
+	}
+
+	for (const auto &segment : segments)
+	{
+		if (segment != nullptr)
+		{
+			OnSegmentCreated(segment);
+		}
+	}
+}

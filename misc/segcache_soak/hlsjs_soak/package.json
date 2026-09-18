@@ -1,0 +1,9 @@
+{
+  "name": "ome-hlsjs-soak",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "hls.js": "^1.5.17",
+    "playwright": "^1.48.0"
+  }
+}

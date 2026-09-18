@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <shared_mutex>
+#include <vector>
 
 class HlsMediaPlaylist
 {
@@ -71,6 +72,12 @@ public:
 	std::size_t GetSegmentCount() const;
 	bool HasSegment(int64_t number) const;
 	void ClearSegments();
+
+	// Replace the live window for SegmentCache idle serve. Sets
+	// EXT-X-DISCONTINUITY-SEQUENCE accounting from disc_sequence_before_first
+	// (wraps that fully precede the first listed segment) instead of wiping it.
+	void ReplaceIdleWindow(const std::vector<std::shared_ptr<base::modules::Segment>> &segments,
+						   int64_t disc_sequence_before_first);
 
 private:
 	// Recompute the cached CODECS union. Caller must hold _segments_mutex exclusively.

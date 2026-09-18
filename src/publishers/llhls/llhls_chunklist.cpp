@@ -346,8 +346,21 @@ void LLHlsChunklist::ClearAllSegmentInfo()
 		_last_partial_segment_sequence = -1;
 		_upcoming_map_uri.Clear();
 		_first_segment = true;
+		_last_started_track_version.reset();
 	}
 	UpdateCacheForDefaultChunklist();
+}
+
+void LLHlsChunklist::PrepareIdleWindow(int64_t disc_sequence_before_first)
+{
+	if (disc_sequence_before_first < 0)
+	{
+		disc_sequence_before_first = 0;
+	}
+
+	ClearAllSegmentInfo();
+	_removed_discontinuity_count.store(disc_sequence_before_first);
+	_total_discontinuity_count.store(disc_sequence_before_first);
 }
 
 void LLHlsChunklist::SetPreloadHintEnabled(bool enabled)
