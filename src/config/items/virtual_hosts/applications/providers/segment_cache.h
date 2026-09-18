@@ -79,17 +79,12 @@ namespace cfg
 					ov::String _mode = "persist";
 					SegmentCacheHydrate _hydrate;
 					int _idle_grace_period_ms = 30000;
-					// Classic HLS only: advertise this many segments past the wall-clock
-					// playhead so players that join ~2–3 segments behind the live edge
-					// land near LLHLS / schedule time. 0 = edge at playhead (default).
-					int _hls_lookahead_segments = 0;
 
 				public:
 					CFG_DECLARE_CONST_REF_GETTER_OF(IsEnable, _enable)
 					CFG_DECLARE_CONST_REF_GETTER_OF(GetMode, _mode)
 					CFG_DECLARE_CONST_REF_GETTER_OF(GetHydrate, _hydrate)
 					CFG_DECLARE_CONST_REF_GETTER_OF(GetIdleGracePeriodMs, _idle_grace_period_ms)
-					CFG_DECLARE_CONST_REF_GETTER_OF(GetHlsLookaheadSegments, _hls_lookahead_segments)
 
 					bool IsPersist() const
 					{
@@ -117,15 +112,6 @@ namespace cfg
 								return CreateConfigErrorPtr(
 									"SegmentCache/IdleGracePeriodMs must be between 0 and 600000 (got: %d)",
 									_idle_grace_period_ms);
-							}
-							return nullptr;
-						});
-						Register<Optional>("HlsLookaheadSegments", &_hls_lookahead_segments, nullptr, [=]() -> std::shared_ptr<ConfigError> {
-							if (_hls_lookahead_segments < 0 || _hls_lookahead_segments > 100)
-							{
-								return CreateConfigErrorPtr(
-									"SegmentCache/HlsLookaheadSegments must be between 0 and 100 (got: %d)",
-									_hls_lookahead_segments);
 							}
 							return nullptr;
 						});

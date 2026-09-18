@@ -138,10 +138,6 @@ SegmentCache does **not** transcode. It applies only to `file://` items that are
             <MaxThroughputMbps>50</MaxThroughputMbps> <!-- 0 = unlimited -->
         </Hydrate>
         <IdleGracePeriodMs>30000</IdleGracePeriodMs>
-        <!-- Classic HLS: list N segments past wall-clock playhead so players that
-             join ~2–3 segments behind the edge land near LLHLS / schedule time.
-             LLHLS is unchanged. 0 = default (edge at playhead). -->
-        <HlsLookaheadSegments>3</HlsLookaheadSegments>
     </SegmentCache>
 </Schedule>
 ```
@@ -179,9 +175,6 @@ Soft cap on aggregate sample-index build + hydrate throughput across workers, in
 `<SegmentCache>/<IdleGracePeriodMs> (optional, default: 30000)`\
 When SegmentCache is active and there are **no** WebRTC/OVT sessions, HLS/LLHLS alone do not keep the demux pump running. If the pump is already running and demand drops to zero, OvenMediaEngine keeps pumping for this many milliseconds before entering idle cache playback (avoids thrashing on brief viewer gaps). `0` means leave idle as soon as demand is zero. Allowed range: **0–600000**. Out of range fails Server.xml load.
 
-`<SegmentCache>/<HlsLookaheadSegments> (optional, default: 0)`\
-Classic HLS only. When SegmentCache idle-serves a scheduled `file://` item, the media playlist normally ends at the wall-clock playhead. Classic HLS players typically start **2–3 segments behind** that edge, so they run ~10s+ behind LLHLS on the same schedule. Set this to the number of **future** segments to advertise past the playhead (media is already on disk). Players that still join near `edge − 3` then land near schedule / LLHLS time. `0` keeps the previous behavior. LLHLS chunklists stay edge-accurate (parts only up to now). Allowed range: **0–100**. Out of range fails Server.xml load. A value around **2–3** matches typical HLS join depth for common segment durations.
-
 ### Per-stream override in `.sch`
 
 Omit `<Stream>/<SegmentCache>` to inherit Server.xml. To force on or off for one channel:
@@ -198,7 +191,7 @@ Omit `<Stream>/<SegmentCache>` to inherit Server.xml. To force on or off for one
 </Stream>
 ```
 
-`<SegmentCache>true</SegmentCache>` (boolean text) is also accepted. Mode, Hydrate, IdleGracePeriodMs, and HlsLookaheadSegments always come from Server.xml — the `.sch` override is enable/disable only.
+`<SegmentCache>true</SegmentCache>` (boolean text) is also accepted. Mode, Hydrate, and IdleGracePeriodMs always come from Server.xml — the `.sch` override is enable/disable only.
 
 `stream://` items in the same schedule are never cached; only matching `file://` items use the cache.
 
