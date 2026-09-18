@@ -6,6 +6,7 @@
 #include "idle_playlist_driver.h"
 
 #include <algorithm>
+#include <cstdint>
 
 #define OV_LOG_TAG "SegmentCache.IdlePlaylist"
 
@@ -62,34 +63,54 @@ namespace segment_cache
 
 		_playhead = _session->ResolvePlayhead(_elapsed_ms);
 		const size_t n = plan.segments.size();
-		const size_t window = std::min(_config.window_segments, n);
+		const size_t want = std::min(_config.window_segments, n);
 
-		// Advertise the last `window` completed segments ending at the current one.
-		// Current segment is included so players can request the live edge.
-		const size_t end_ord = _playhead.segment_ordinal;
-		size_t start_ord = 0;
-		if (end_ord + 1 >= window)
+		// Walk backward from the playhead so the window bridges a loop wrap
+		// (previous loop's tail + new loop's head) instead of shrinking to 1.
+		struct Cursor
 		{
-			start_ord = end_ord + 1 - window;
-		}
+			int64_t loop = 0;
+			int64_t ord = 0;
+		};
+		Cursor cur{static_cast<int64_t>(_playhead.loop_count),
+				   static_cast<int64_t>(_playhead.segment_ordinal)};
 
-		// Absolute sequence accounts for prior full loops.
-		const int64_t loop_base =
-			static_cast<int64_t>(_playhead.loop_count) * static_cast<int64_t>(n);
+		std::vector<IdlePlaylistEntry> newest_first;
+		newest_first.reserve(want);
 
-		_media_sequence_start = loop_base + static_cast<int64_t>(start_ord);
-
-		for (size_t ord = start_ord; ord <= end_ord; ord++)
+		for (size_t i = 0; i < want; i++)
 		{
-			const auto &seg = plan.segments[ord];
+			const auto &seg = plan.segments[static_cast<size_t>(cur.ord)];
 			IdlePlaylistEntry entry;
-			entry.plan_ordinal = ord;
-			entry.media_sequence = loop_base + static_cast<int64_t>(ord);
+			entry.plan_ordinal = static_cast<size_t>(cur.ord);
+			entry.media_sequence = cur.loop * static_cast<int64_t>(n) + cur.ord;
 			entry.start_dts = seg.start_dts;
 			entry.end_dts = seg.end_dts;
 			entry.duration_ms = static_cast<double>(seg.end_dts - seg.start_dts) / 90.0;
 			entry.part_count = seg.parts.size();
-			_window.push_back(entry);
+			entry.discontinuity =
+				IsWrapDiscontinuity(entry.media_sequence, entry.plan_ordinal, n);
+			newest_first.push_back(entry);
+
+			if (cur.ord > 0)
+			{
+				cur.ord--;
+			}
+			else if (cur.loop > 0)
+			{
+				cur.loop--;
+				cur.ord = static_cast<int64_t>(n) - 1;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		_window.assign(newest_first.rbegin(), newest_first.rend());
+		if (_window.empty() == false)
+		{
+			_media_sequence_start = _window.front().media_sequence;
 		}
 	}
 }  // namespace segment_cache

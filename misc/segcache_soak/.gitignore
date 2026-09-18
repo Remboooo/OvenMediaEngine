@@ -1,0 +1,12 @@
+dogfood/conf/Server.id
+dogfood/logs/
+dogfood/run/
+*_journal.txt
+logs/
+*.progress
+*.pyc
+__pycache__/
+stress_summary_*.json
+summary_*.json
+hlsjs_soak/node_modules/
+dogfood/media/*.mp4
