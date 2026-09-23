@@ -497,8 +497,13 @@ std::shared_ptr<LLHlsHttpInterceptor> LLHlsPublisher::CreateInterceptor()
 				}
 			}
 
-			// It will be used in CloseHandler
+			// It will be used in CloseHandler. The per-stream key only remembers the
+			// latest session (reused for master playlist requests); the per-session key
+			// keeps every session this connection served, since a keep-alive connection
+			// (e.g. a reverse proxy pool) can carry several players. Otherwise earlier
+			// sessions never see this connection close and leak.
 			connection->AddUserData(stream->GetStreamId(), session->GetSessionPath());
+			connection->AddUserData(ov::String::FormatString("%s#%u", stream->GetStreamId().CStr(), session->GetId()), session->GetSessionPath());
 			session->UpdateLastRequest(connection->GetId());
 		}
 
