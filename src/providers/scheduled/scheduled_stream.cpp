@@ -342,7 +342,15 @@ namespace pvd
 		if (GetPumpDemandCount() > 0)
 		{
 			_pump_demand_zero_since_ms.store(-1);
+			_pump_saw_demand.store(true);
 			return true;
+		}
+
+		// Pump only ran to bridge an item edge (cache not ready yet): no one to
+		// keep it alive for, so skip the grace period.
+		if (_pump_saw_demand.load() == false)
+		{
+			return false;
 		}
 
 		// No WebRTC/OVT demand. Enter idle immediately unless the demux pump is
@@ -369,10 +377,17 @@ namespace pvd
 		return (now - zero_since) < grace_ms;
     }
 
+    void ScheduledStream::ReanchorPumpPacing()
+    {
+		_global_track_offset_us_map.clear();
+		_pacing_anchor_elapsed_us = std::max<int64_t>(0, _realtime_clock.ElapsedUs());
+    }
+
     ScheduledStream::PlaybackResult ScheduledStream::PlayFileIdle(const std::shared_ptr<Schedule::Item> &item, bool fallback_item)
     {
 		_media_pump_running.store(false);
 		_pump_demand_zero_since_ms.store(-1);
+		_pump_saw_demand.store(false);
 		segment_cache::SessionRegistry::GetInstance().SetCacheServeEnabled(GetName(), true);
 
 		logti("Scheduled Channel : %s/%s: Idle cache playback for %s (no demux)",
@@ -907,6 +922,10 @@ namespace pvd
             _realtime_clock.Resume();
         }
 
+		// Pace this item from now: the output DTS continues from the last sent
+		// packet, so wall time spent idle / preparing must not be caught up.
+		ReanchorPumpPacing();
+
         // Play
         AVPacket packet = { 0 };
         std::map<int, bool> track_first_packet_map;
@@ -960,6 +979,7 @@ namespace pvd
 					break;
 				}
 				_media_pump_running.store(true);
+				ReanchorPumpPacing();
 				continue;
 			}
 
@@ -1081,10 +1101,24 @@ namespace pvd
 			int64_t dts_us = Rescale(dts, 1000000 * track->GetTimeBase().GetNum(), track->GetTimeBase().GetDen());
 			if (_global_track_offset_us_map.find(track_id) == _global_track_offset_us_map.end())
 			{
-				_global_track_offset_us_map[track_id] = dts_us;
+				_global_track_offset_us_map[track_id] = dts_us - _pacing_anchor_elapsed_us;
 			}
 
 			int64_t global_zero_based_dts = dts_us - _global_track_offset_us_map[track_id];
+
+			// Safety net: if demux fell far behind wall clock (disk stall, blocked
+			// thread), re-anchor instead of bursting the backlog into MediaRouter.
+			{
+				constexpr int64_t kMaxPacingLagUs = 2 * 1000 * 1000;
+				const int64_t elapsed_us = _realtime_clock.ElapsedUs();
+				if (elapsed_us - global_zero_based_dts > kMaxPacingLagUs)
+				{
+					logtw("Scheduled Channel : %s/%s: Track %d pacing lag %" PRId64 " ms — re-anchoring instead of bursting",
+						  GetApplicationName(), GetName().CStr(), track_id, (elapsed_us - global_zero_based_dts) / 1000);
+					_global_track_offset_us_map[track_id] = dts_us - elapsed_us;
+					global_zero_based_dts = elapsed_us;
+				}
+			}
 
             media_packet->SetPts(pts);
             media_packet->SetDts(dts);

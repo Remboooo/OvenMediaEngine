@@ -69,6 +69,9 @@ namespace pvd
         int64_t GetPumpGracePeriodMs() const;
         segment_cache::Options ResolveSegmentCacheOptions() const;
         PlaybackResult PlayFileIdle(const std::shared_ptr<Schedule::Item> &item, bool fallback_item);
+		// Restart demux pacing at "now". Wall time spent idle (or blocked) must not
+		// become a debt the pump repays by bursting packets at demux speed.
+		void ReanchorPumpPacing();
 
 		// Wall-clock cache playhead: while IsCacheServeEnabled, HLS/LLHLS MSN must
 		// advance at 1x wall even if demux bursts after a WebRTC seek.
@@ -144,6 +147,9 @@ namespace pvd
 
         ov::StopWatch _realtime_clock;
 		std::map<uint32_t, int64_t> _global_track_offset_us_map;
+		// _realtime_clock elapsed (us) at the last pacing re-anchor; first packet per
+		// track after a re-anchor maps to this point instead of the original clock start.
+		int64_t _pacing_anchor_elapsed_us = 0;
         ov::StopWatch _failback_check_clock;
 
         std::map<uint32_t, std::shared_ptr<MediaPacket>> _last_packet_map;
@@ -152,6 +158,9 @@ namespace pvd
 		mutable std::atomic<bool> _media_pump_running{false};
 		// Monotonic ms when demand last dropped to 0 while pump was running; -1 = not timing.
 		mutable std::atomic<int64_t> _pump_demand_zero_since_ms{-1};
+		// True once WebRTC/OVT demand was seen since the last idle entry. Grace only
+		// applies then; a pump started just to bridge cache-not-ready idles at once.
+		mutable std::atomic<bool> _pump_saw_demand{false};
 
 		// Anchor for wall-driven cache playhead (mono ms, elapsed ms at that mono).
 		int64_t _cache_playhead_anchor_mono_ms{-1};
