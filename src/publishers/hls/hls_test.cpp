@@ -549,3 +549,30 @@ TEST_F(HlsMediaPlaylistTest, ExcludedFlag)
 	playlist->SetExcluded(true);
 	EXPECT_TRUE(playlist->IsExcluded());
 }
+
+TEST_F(HlsMediaPlaylistTest, TargetDurationCoversRoundedExtinf)
+{
+	// SegmentCache cuts 6.006 s segments while HLS SegmentDuration is 5:
+	// RFC 8216 4.3.3.1 requires round(EXTINF) <= EXT-X-TARGETDURATION.
+	HlsMediaPlaylist::HlsMediaPlaylistConfig config;
+	config.target_duration = 5;
+	HlsMediaPlaylist playlist("variant", "medialist.m3u8", config);
+	playlist.SetWallclockOffset(0);
+
+	playlist.OnSegmentCreated(MakeSegment(0, 0, 5400, 0, false, "avc1.640028"));
+	EXPECT_NE(playlist.ToString(true).IndexOf("#EXT-X-TARGETDURATION:5\n"), -1L);
+
+	playlist.OnSegmentCreated(MakeSegment(1, 90000 * 5, 6006, 0, false, "avc1.640028"));
+	EXPECT_NE(playlist.ToString(true).IndexOf("#EXT-X-TARGETDURATION:6\n"), -1L);
+}
+
+TEST_F(HlsMediaPlaylistTest, RaiseTargetDurationOnlyGrows)
+{
+	auto playlist = MakePlaylist();
+
+	playlist->RaiseTargetDuration(8);
+	playlist->RaiseTargetDuration(7);
+	playlist->OnSegmentCreated(MakeSegment(0, 0, 6000, 0, false, "avc1.640028"));
+
+	EXPECT_NE(playlist->ToString(true).IndexOf("#EXT-X-TARGETDURATION:8\n"), -1L);
+}

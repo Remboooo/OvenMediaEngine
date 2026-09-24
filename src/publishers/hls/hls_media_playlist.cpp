@@ -11,6 +11,7 @@
 #include "hls_private.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include <base/modules/data_format/cue_event/cue_event.h>
 
@@ -173,7 +174,7 @@ ov::String HlsMediaPlaylist::ToString(bool rewind) const
 	{
 		result += ov::String::FormatString("#EXT-X-PLAYLIST-TYPE:EVENT\n");
 	}
-	result += ov::String::FormatString("#EXT-X-TARGETDURATION:%zu\n", _config.target_duration);
+	result += ov::String::FormatString("#EXT-X-TARGETDURATION:%zu\n", GetTargetDurationLocked());
 
 	if (_segments.empty() == true)
 	{
@@ -259,6 +260,11 @@ uint32_t HlsMediaPlaylist::GetBitrates() const
 	}
 
 	return bitrates;
+}
+
+uint32_t HlsMediaPlaylist::GetBandwidth() const
+{
+	return std::max(GetBitrates(), GetAverageBitrate());
 }
 
 uint32_t HlsMediaPlaylist::GetAverageBitrate() const
@@ -457,4 +463,25 @@ void HlsMediaPlaylist::ReplaceIdleWindow(
 			OnSegmentCreated(segment);
 		}
 	}
+}
+
+void HlsMediaPlaylist::RaiseTargetDuration(size_t seconds)
+{
+	size_t current = _min_target_duration.load();
+	while (seconds > current && _min_target_duration.compare_exchange_weak(current, seconds) == false)
+	{
+	}
+}
+
+size_t HlsMediaPlaylist::GetTargetDurationLocked() const
+{
+	// RFC 8216 4.3.3.1: every EXTINF, rounded to the nearest integer, must be
+	// <= EXT-X-TARGETDURATION.
+	size_t target = std::max(_config.target_duration, _min_target_duration.load());
+	for (const auto &[number, segment] : _segments)
+	{
+		const auto rounded = static_cast<size_t>(std::llround(segment->GetDurationMs() / 1000.0));
+		target = std::max(target, rounded);
+	}
+	return target;
 }
