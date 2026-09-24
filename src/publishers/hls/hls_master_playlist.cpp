@@ -88,7 +88,7 @@ ov::String HlsMasterPlaylist::ToString(bool rewind) const
 		if (media_playlist->HasVideo())
 		{
 			result += ov::String::FormatString("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%s,FRAME-RATE=%.3f,CODECS=\"%s\"",
-											media_playlist->GetBitrates(),
+											media_playlist->GetBandwidth(),
 											media_playlist->GetAverageBitrate(),
 											media_playlist->GetResolutionString().CStr(),
 											media_playlist->GetFramerate(),	
@@ -103,7 +103,7 @@ ov::String HlsMasterPlaylist::ToString(bool rewind) const
 		else
 		{
 			result += ov::String::FormatString("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,CODECS=\"%s\"",
-											media_playlist->GetBitrates(),
+											media_playlist->GetBandwidth(),
 											media_playlist->GetAverageBitrate(),
 											media_playlist->GetCodecsString().CStr());
 			if (has_vtt)
