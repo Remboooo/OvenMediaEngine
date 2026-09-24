@@ -57,6 +57,10 @@ public:
 
 	uint32_t GetBitrates() const;
 	uint32_t GetAverageBitrate() const;
+	// EXT-X-STREAM-INF BANDWIDTH (peak). The last-second measurement is only
+	// meaningful while packets flow (0 in SegmentCache idle, huge during a
+	// demux burst), so never advertise less than AVERAGE-BANDWIDTH.
+	uint32_t GetBandwidth() const;
 	bool GetResolution(uint32_t &width, uint32_t &height) const;
 	// <width>x<height>
 	ov::String GetResolutionString() const;
@@ -79,11 +83,21 @@ public:
 	void ReplaceIdleWindow(const std::vector<std::shared_ptr<base::modules::Segment>> &segments,
 						   int64_t disc_sequence_before_first);
 
+	// Floor for EXT-X-TARGETDURATION (seconds). Only ever raised, so the value
+	// stays stable across item changes. SegmentCache segments are cut by the
+	// cache plan, not by this publisher's SegmentDuration.
+	void RaiseTargetDuration(size_t seconds);
+
 private:
 	// Recompute the cached CODECS union. Caller must hold _segments_mutex exclusively.
 	void RebuildCodecsParameter();
 
+	// EXT-X-TARGETDURATION: max of config, RaiseTargetDuration() floor and the
+	// rounded EXTINF of retained segments. Caller must hold _segments_mutex.
+	size_t GetTargetDurationLocked() const;
+
 	HlsMediaPlaylistConfig _config;
+	std::atomic<size_t> _min_target_duration{0};
 	ov::String _variant_name;
 	ov::String _playlist_file_name;
 

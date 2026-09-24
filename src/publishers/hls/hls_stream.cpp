@@ -1355,6 +1355,17 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 
 	const size_t plan_size = session->GetPlan().segments.size();
 	const int64_t item_ms = std::max<int64_t>(1, session->GetItemDurationMs());
+
+	// Cache segments are cut by the plan (keyframe-aligned, may exceed this
+	// publisher's SegmentDuration), so advertise the plan's longest segment.
+	{
+		int64_t max_dts = 0;
+		for (const auto &planned : session->GetPlan().segments)
+		{
+			max_dts = std::max<int64_t>(max_dts, planned.end_dts - planned.start_dts);
+		}
+		playlist->RaiseTargetDuration(static_cast<size_t>(std::llround(static_cast<double>(max_dts) / 90000.0)));
+	}
 	const int64_t first_msn = window.front().media_sequence;
 	const int64_t disc_seq =
 		segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
