@@ -21,6 +21,7 @@
 
 #include <base/ovlibrary/bit_writer.h>
 #include <base/ovlibrary/data.h>
+#include <modules/bitstream/nalu/nal_unit_test_helpers.h>
 #include <modules/bitstream/h265/h265_decoder_configuration_record.h>
 #include <modules/bitstream/h265/h265_parser.h>
 
@@ -29,62 +30,11 @@
 
 namespace
 {
-	// ---- Exp-Golomb writers (Rec. ITU-T H.265 9.2) ----
-	void WriteUE(ov::BitWriter &w, uint32_t v)
-	{
-		uint64_t n = static_cast<uint64_t>(v) + 1;
-		int numbits = 0;
-		while ((n >> (numbits + 1)) != 0)
-		{
-			numbits++;
-		}
-		if (numbits > 0)
-		{
-			w.WriteBits(numbits, 0);
-		}
-		w.WriteBits(numbits + 1, n);
-	}
-
-	void WriteSE(ov::BitWriter &w, int32_t v)
-	{
-		uint32_t code = (v <= 0) ? static_cast<uint32_t>(-2 * static_cast<int64_t>(v))
-								 : static_cast<uint32_t>(2 * static_cast<int64_t>(v) - 1);
-		WriteUE(w, code);
-	}
-
-	// rbsp_trailing_bits(): stop bit '1' then zero-pad to a byte boundary.
-	void WriteTrailing(ov::BitWriter &w)
-	{
-		w.WriteBits(1, 1);
-		while (w.GetBitCount() % 8 != 0)
-		{
-			w.WriteBits(1, 0);
-		}
-	}
-
-	std::vector<uint8_t> ToBytes(ov::BitWriter &w)
-	{
-		return std::vector<uint8_t>(w.GetData(), w.GetData() + w.GetDataSize());
-	}
-
-	// Insert emulation_prevention_three_byte into an RBSP payload to form an EBSP.
-	std::vector<uint8_t> ApplyEmulationPrevention(const std::vector<uint8_t> &rbsp)
-	{
-		std::vector<uint8_t> out;
-		out.reserve(rbsp.size() + 4);
-		size_t zeros = 0;
-		for (uint8_t b : rbsp)
-		{
-			if (zeros >= 2 && b <= 0x03)
-			{
-				out.push_back(0x03);
-				zeros = 0;
-			}
-			out.push_back(b);
-			zeros = (b == 0x00) ? zeros + 1 : 0;
-		}
-		return out;
-	}
+	using ome_test::ApplyEmulationPrevention;
+	using ome_test::ToBytes;
+	using ome_test::WriteSE;
+	using ome_test::WriteTrailing;
+	using ome_test::WriteUE;
 
 	// Build a NAL unit: 2-byte header (nal_type) + emulation-prevented RBSP.
 	std::vector<uint8_t> MakeNal(uint8_t nal_type, const std::vector<uint8_t> &rbsp)
@@ -123,6 +73,16 @@ namespace
 		uint32_t num_positive_pics = 0;
 		bool long_term_ref_pics_present = false;
 		uint32_t num_long_term_ref_pics_sps = 0;
+	};
+
+	// vui_timing_info (Rec. ITU-T H.265 E.2.1). Absent unless vui_present is set, which is how
+	// an encoder that carries no timing information emits the SPS.
+	struct VuiTimingInfo
+	{
+		bool vui_present		   = false;
+		bool timing_info_present   = false;
+		uint32_t num_units_in_tick = 0;
+		uint32_t time_scale		   = 0;
 	};
 
 	// ---- Minimal VPS (Rec. ITU-T H.265 7.3.2.1). Only needed so a record becomes valid. ----
@@ -165,30 +125,57 @@ namespace
 	// (delta_poc_s0_minus1=0, used_by_curr_pic_s0_flag=1), num_positive_pics=0
 	// -> NumDeltaPocs == 1. log2_diff selects CtbLog2SizeY (= 3 + log2_diff).
 	std::vector<uint8_t> BuildSps(bool sao_enabled, uint32_t num_strps = 0, uint32_t log2_diff = 3,
-								  const SpsOverrides &overrides = {},
+								  const SpsOverrides &overrides				 = {},
 								  uint32_t log2_max_pic_order_cnt_lsb_minus4 = 0,
-								  uint32_t sps_id = 0)
+								  uint32_t sps_id							 = 0,
+								  uint32_t max_sub_layers_minus1			 = 0,
+								  const VuiTimingInfo &vui					 = {})
 	{
 		ov::BitWriter w(64);
-		w.WriteBits(4, 0);	// sps_video_parameter_set_id
-		w.WriteBits(3, 0);	// sps_max_sub_layers_minus1
-		w.WriteBits(1, 0);	// sps_temporal_id_nesting_flag
+		w.WriteBits(4, 0);						// sps_video_parameter_set_id
+		w.WriteBits(3, max_sub_layers_minus1);	// sps_max_sub_layers_minus1
+		w.WriteBits(1, 0);						// sps_temporal_id_nesting_flag
 
-		// profile_tier_level (max_sub_layers_minus1 == 0 -> 96 bits)
-		w.WriteBits(2, 0);			 // general_profile_space
-		w.WriteBits(1, 0);			 // general_tier_flag
-		w.WriteBits(5, 1);			 // general_profile_idc (Main)
-		w.WriteBits(32, 0x60000000); // general_profile_compatibility_flags
-		w.WriteBits(32, 0);			 // general_constraint_indicator_flags (hi 32)
-		w.WriteBits(16, 0);			 // general_constraint_indicator_flags (lo 16)
-		w.WriteBits(8, 93);			 // general_level_idc (3.1)
+		// profile_tier_level, general part (96 bits)
+		w.WriteBits(2, 0);			  // general_profile_space
+		w.WriteBits(1, 0);			  // general_tier_flag
+		w.WriteBits(5, 1);			  // general_profile_idc (Main)
+		w.WriteBits(32, 0x60000000);  // general_profile_compatibility_flags
+		w.WriteBits(32, 0);			  // general_constraint_indicator_flags (hi 32)
+		w.WriteBits(16, 0);			  // general_constraint_indicator_flags (lo 16)
+		w.WriteBits(8, 93);			  // general_level_idc (3.1)
 
-		WriteUE(w, sps_id);	// sps_seq_parameter_set_id
-		WriteUE(w, 1);	// chroma_format_idc (4:2:0)
+		// profile_tier_level, sub-layer part. The parser skips 88 bits per present profile.
+		for (uint32_t i = 0; i < max_sub_layers_minus1; i++)
+		{
+			w.WriteBits(1, 1);	// sub_layer_profile_present_flag[i]
+			w.WriteBits(1, 1);	// sub_layer_level_present_flag[i]
+		}
+
+		if (max_sub_layers_minus1 > 0)
+		{
+			for (uint32_t i = max_sub_layers_minus1; i < 8; i++)
+			{
+				w.WriteBits(2, 0);	// reserved_zero_2bits[i]
+			}
+		}
+
+		for (uint32_t i = 0; i < max_sub_layers_minus1; i++)
+		{
+			// sub_layer_profile_space(2) + tier_flag(1) + profile_idc(5)
+			// + profile_compatibility_flag(32) + 4 constraint flags + reserved(44)
+			w.WriteBits(44, 0);
+			w.WriteBits(44, 0);
+
+			w.WriteBits(8, 93);	 // sub_layer_level_idc[i]
+		}
+
+		WriteUE(w, sps_id);				   // sps_seq_parameter_set_id
+		WriteUE(w, 1);					   // chroma_format_idc (4:2:0)
 		WriteUE(w, overrides.pic_width);   // pic_width_in_luma_samples
 		WriteUE(w, overrides.pic_height);  // pic_height_in_luma_samples
-		w.WriteBits(1, 0);	// conformance_window_flag
-		WriteUE(w, 0);	// bit_depth_luma_minus8
+		w.WriteBits(1, 0);				   // conformance_window_flag
+		WriteUE(w, 0);					   // bit_depth_luma_minus8
 		WriteUE(w, 0);	// bit_depth_chroma_minus8
 		WriteUE(w, log2_max_pic_order_cnt_lsb_minus4);	// log2_max_pic_order_cnt_lsb_minus4
 
@@ -239,9 +226,32 @@ namespace
 				w.WriteBits(1, 0);	// used_by_curr_pic_lt_sps_flag[i]
 			}
 		}
-		w.WriteBits(1, 0);	// sps_temporal_mvp_enabled_flag
-		w.WriteBits(1, 0);	// strong_intra_smoothing_enabled_flag
-		w.WriteBits(1, 0);	// vui_parameters_present_flag
+		w.WriteBits(1, 0);						  // sps_temporal_mvp_enabled_flag
+		w.WriteBits(1, 0);						  // strong_intra_smoothing_enabled_flag
+		w.WriteBits(1, vui.vui_present ? 1 : 0);  // vui_parameters_present_flag
+		if (vui.vui_present)
+		{
+			w.WriteBits(1, 0);	// aspect_ratio_info_present_flag
+			w.WriteBits(1, 0);	// overscan_info_present_flag
+			w.WriteBits(1, 0);	// video_signal_type_present_flag
+			w.WriteBits(1, 0);	// chroma_loc_info_present_flag
+			w.WriteBits(1, 0);	// neutral_chroma_indication_flag
+			w.WriteBits(1, 0);	// field_seq_flag
+			w.WriteBits(1, 0);	// frame_field_info_present_flag
+			w.WriteBits(1, 0);	// default_display_window_flag
+
+			w.WriteBits(1, vui.timing_info_present ? 1 : 0);  // vui_timing_info_present_flag
+			if (vui.timing_info_present)
+			{
+				w.WriteBits(32, vui.num_units_in_tick);	 // vui_num_units_in_tick
+				w.WriteBits(32, vui.time_scale);		 // vui_time_scale
+				w.WriteBits(1, 0);						 // vui_poc_proportional_to_timing_flag
+				w.WriteBits(1, 0);						 // vui_hrd_parameters_present_flag
+			}
+
+			w.WriteBits(1, 0);	// bitstream_restriction_flag
+		}
+
 		w.WriteBits(1, 0);	// sps_extension_flag
 
 		WriteTrailing(w);
@@ -1182,4 +1192,59 @@ TEST(H265Parser, SliceHeaderRejectsExcessiveOffsetLen)
 
 	slice = BuildWppIdrSlice(/*num_entry_point_offsets=*/2, /*offset_len_minus1=*/H265_MAX_OFFSET_LEN_MINUS1 + 1);
 	EXPECT_FALSE(H265Parser::ParseSliceHeader(slice.data(), slice.size(), shd, record));
+}
+
+// An SPS with no VUI leaves num_units_in_tick at 0, and the frame rate is a plain integer
+// division by it
+TEST(H265Parser, ReportsZeroFpsWhenTheSpsCarriesNoVui)
+{
+	const auto sps_nal = BuildSps(false);
+
+	H265SPS sps;
+	ASSERT_TRUE(H265Parser::ParseSPS(sps_nal.data(), sps_nal.size(), sps));
+
+	EXPECT_EQ(sps.GetVuiParameters()._num_units_in_tick, 0U);
+	EXPECT_FLOAT_EQ(sps.GetFps(), 0.0f);
+}
+
+// vui_num_units_in_tick is stored without a range check, so a stream can carry timing_info whose
+// tick count is 0
+TEST(H265Parser, ReportsZeroFpsWhenTheVuiTickCountIsZero)
+{
+	const auto sps_nal = BuildSps(false, 0, 3, {}, 0, 0, 0, {true, true, 0, 60000});
+
+	H265SPS sps;
+	ASSERT_TRUE(H265Parser::ParseSPS(sps_nal.data(), sps_nal.size(), sps));
+
+	EXPECT_EQ(sps.GetVuiParameters()._num_units_in_tick, 0U);
+	EXPECT_EQ(sps.GetVuiParameters()._time_scale, 60000U);
+	EXPECT_FLOAT_EQ(sps.GetFps(), 0.0f);
+}
+
+// An HEVC profile_tier_level carrying sub-layer profile info makes the parser skip 88 bits at
+// once, which is wider than a single ReadBits() call can take
+TEST(H265Parser, ParsesAnSpsWithSubLayerProfileTierLevel)
+{
+	const auto sps_nal = BuildSps(false, 0, 3, {}, 0, 0, 1);
+
+	H265SPS sps;
+	ASSERT_TRUE(H265Parser::ParseSPS(sps_nal.data(), sps_nal.size(), sps));
+
+	EXPECT_EQ(sps.GetWidth(), 320U);
+	EXPECT_EQ(sps.GetHeight(), 240U);
+	EXPECT_EQ(sps.GetMaxSubLayersMinus1(), 1U);
+}
+
+
+// GetFps() returns a float, so the division must not truncate first
+TEST(H265Parser, DerivesANonIntegerFrameRateFromTheVui)
+{
+	const auto sps_nal = BuildSps(false, 0, 3, {}, 0, 0, 0, {true, true, 2002, 60000});
+
+	H265SPS sps;
+	ASSERT_TRUE(H265Parser::ParseSPS(sps_nal.data(), sps_nal.size(), sps));
+
+	EXPECT_EQ(sps.GetVuiParameters()._num_units_in_tick, 2002U);
+	EXPECT_EQ(sps.GetVuiParameters()._time_scale, 60000U);
+	EXPECT_NEAR(sps.GetFps(), 29.97f, 0.01f);
 }

@@ -159,7 +159,13 @@ public:
 
     float GetFps() const
     {
-        return _vui_parameters._time_scale / _vui_parameters._num_units_in_tick;
+		// `timing_info` is optional, so the tick count can still be 0 here
+		if (_vui_parameters._num_units_in_tick == 0)
+		{
+			return 0.0f;
+		}
+
+		return static_cast<float>(_vui_parameters._time_scale) / _vui_parameters._num_units_in_tick;
     }
 
     uint32_t GetId() const
