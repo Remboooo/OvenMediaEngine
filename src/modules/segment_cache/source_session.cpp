@@ -371,6 +371,18 @@ namespace segment_cache
 			elapsed_ms = 0;
 		}
 		_elapsed_ms.store(elapsed_ms);
+
+		const size_t plan_size = _plan->segments.size();
+		if (plan_size > 0)
+		{
+			const auto head = ResolvePlayhead(elapsed_ms);
+			const int64_t own = static_cast<int64_t>(head.loop_count) * static_cast<int64_t>(plan_size) +
+								static_cast<int64_t>(head.segment_ordinal);
+			int64_t current = _max_own_sequence.load();
+			while (own > current && _max_own_sequence.compare_exchange_weak(current, own) == false)
+			{
+			}
+		}
 	}
 
 	int64_t SourceSession::GetElapsedMs() const
@@ -450,9 +462,57 @@ namespace segment_cache
 		return env != nullptr && env[0] == '1' && env[1] == '\0';
 	}
 
+	SourceSession::SequenceOrigin SourceSession::NextSequenceOrigin() const
+	{
+		SequenceOrigin next;
+		next.item_boundary = true;
+		next.msn_base = _sequence_origin.msn_base;
+		next.disc_base = _sequence_origin.disc_base + (_sequence_origin.item_boundary ? 1 : 0);
+
+		const size_t plan_size = _plan->segments.size();
+		if (plan_size == 0)
+		{
+			return next;
+		}
+
+		// Everything up to the furthest playhead may have been advertised; the
+		// wraps at own sequence k * plan_size (k = 1..loop) are discontinuities.
+		const auto head = ResolvePlayhead(GetElapsedMs());
+		int64_t own = static_cast<int64_t>(head.loop_count) * static_cast<int64_t>(plan_size) +
+					  static_cast<int64_t>(head.segment_ordinal);
+		own = std::max(own, _max_own_sequence.load());
+		next.msn_base += own + 1;
+		next.disc_base += own / static_cast<int64_t>(plan_size);
+		return next;
+	}
+
+	bool SourceSession::ResolveSequence(int64_t media_sequence, size_t &plan_ordinal) const
+	{
+		const size_t plan_size = _plan->segments.size();
+		const int64_t own = media_sequence - _sequence_origin.msn_base;
+		if (plan_size == 0 || own < 0)
+		{
+			return false;
+		}
+		plan_ordinal = static_cast<size_t>(own % static_cast<int64_t>(plan_size));
+		return true;
+	}
+
 	void SessionRegistry::Put(const ov::String &stream_name, const std::shared_ptr<SourceSession> &session)
 	{
 		std::lock_guard lock(_mutex);
+		auto prev = _sessions.find(stream_name.CStr());
+		if (prev != _sessions.end() && prev->second != nullptr)
+		{
+			if (prev->second != session)
+			{
+				session->SetSequenceOrigin(prev->second->NextSequenceOrigin());
+			}
+		}
+		else if (auto it = _next_origin.find(stream_name.CStr()); it != _next_origin.end())
+		{
+			session->SetSequenceOrigin(it->second);
+		}
 		_sessions[stream_name.CStr()] = session;
 		// New sessions default to packager-serve until Scheduled enters idle.
 		_cache_serve_enabled.emplace(stream_name.CStr(), false);
@@ -461,6 +521,11 @@ namespace segment_cache
 	void SessionRegistry::Remove(const ov::String &stream_name)
 	{
 		std::lock_guard lock(_mutex);
+		auto it = _sessions.find(stream_name.CStr());
+		if (it != _sessions.end() && it->second != nullptr)
+		{
+			_next_origin[stream_name.CStr()] = it->second->NextSequenceOrigin();
+		}
 		_sessions.erase(stream_name.CStr());
 		_cache_serve_enabled.erase(stream_name.CStr());
 	}
@@ -481,6 +546,7 @@ namespace segment_cache
 		std::lock_guard lock(_mutex);
 		_sessions.clear();
 		_cache_serve_enabled.clear();
+		_next_origin.clear();
 	}
 
 	void SessionRegistry::SetCacheServeEnabled(const ov::String &stream_name, bool enabled)

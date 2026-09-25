@@ -57,6 +57,25 @@ namespace segment_cache
 		// Map wall-clock elapsed ms (looping) onto the boundary plan.
 		IdlePlayhead ResolvePlayhead(int64_t elapsed_ms) const;
 
+		// Numbering across items. Within a session a segment's own sequence is
+		// loop * plan_size + ordinal; the published MEDIA-SEQUENCE is
+		// msn_base + own, so the stream keeps counting up when the next item's
+		// session replaces this one. disc_base counts discontinuities before
+		// own sequence 0; item_boundary marks own sequence 0 as one.
+		struct SequenceOrigin
+		{
+			int64_t msn_base = 0;
+			int64_t disc_base = 0;
+			bool item_boundary = false;
+		};
+		// Set before the session is published (SessionRegistry::Put).
+		void SetSequenceOrigin(const SequenceOrigin &origin) { _sequence_origin = origin; }
+		const SequenceOrigin &GetSequenceOrigin() const { return _sequence_origin; }
+		// Origin for a session that replaces this one at the current playhead.
+		SequenceOrigin NextSequenceOrigin() const;
+		// Published MEDIA-SEQUENCE -> plan ordinal. False if it precedes this session.
+		bool ResolveSequence(int64_t media_sequence, size_t &plan_ordinal) const;
+
 		// Shared playhead for idle playlist sync / pump-off mode (ms into looping item).
 		void SetElapsedMs(int64_t elapsed_ms);
 		int64_t GetElapsedMs() const;
@@ -101,6 +120,9 @@ namespace segment_cache
 		std::atomic<bool> _hydrate_running{false};
 		std::atomic<bool> _hydrate_done{false};
 		std::atomic<int64_t> _last_warm_mono_ms{0};
+		SequenceOrigin _sequence_origin;
+		// Highest own sequence (loop * plan_size + ordinal) the playhead reached.
+		std::atomic<int64_t> _max_own_sequence{-1};
 	};
 
 	// Registry: stream_name → SourceSession for GET overrides.
@@ -130,5 +152,8 @@ namespace segment_cache
 		mutable std::mutex _mutex;
 		std::unordered_map<std::string, std::shared_ptr<SourceSession>> _sessions;
 		std::unordered_map<std::string, bool> _cache_serve_enabled;
+		// Where the next session's numbering continues, kept across Remove() so a
+		// non-cached item in between does not restart MEDIA-SEQUENCE at 0.
+		std::unordered_map<std::string, SourceSession::SequenceOrigin> _next_origin;
 	};
 }  // namespace segment_cache

@@ -40,7 +40,8 @@ namespace segment_cache
 			return 0;
 		}
 		const size_t n = _session->GetPlan().segments.size();
-		return static_cast<int64_t>(_playhead.loop_count) * static_cast<int64_t>(n) +
+		return _session->GetSequenceOrigin().msn_base +
+			   static_cast<int64_t>(_playhead.loop_count) * static_cast<int64_t>(n) +
 			   static_cast<int64_t>(plan_ordinal);
 	}
 
@@ -48,6 +49,7 @@ namespace segment_cache
 	{
 		_window.clear();
 		_media_sequence_start = 0;
+		_discontinuity_sequence = 0;
 		_playhead = {};
 
 		if (_session == nullptr)
@@ -64,6 +66,7 @@ namespace segment_cache
 		_playhead = _session->ResolvePlayhead(_elapsed_ms);
 		const size_t n = plan.segments.size();
 		const size_t want = std::min(_config.window_segments, n);
+		const auto &origin = _session->GetSequenceOrigin();
 
 		// Walk backward from the playhead so the window bridges a loop wrap
 		// (previous loop's tail + new loop's head) instead of shrinking to 1.
@@ -82,14 +85,16 @@ namespace segment_cache
 		{
 			const auto &seg = plan.segments[static_cast<size_t>(cur.ord)];
 			IdlePlaylistEntry entry;
+			const int64_t own = cur.loop * static_cast<int64_t>(n) + cur.ord;
 			entry.plan_ordinal = static_cast<size_t>(cur.ord);
-			entry.media_sequence = cur.loop * static_cast<int64_t>(n) + cur.ord;
+			entry.media_sequence = origin.msn_base + own;
+			entry.loop = cur.loop;
 			entry.start_dts = seg.start_dts;
 			entry.end_dts = seg.end_dts;
 			entry.duration_ms = static_cast<double>(seg.end_dts - seg.start_dts) / 90.0;
 			entry.part_count = seg.parts.size();
 			entry.discontinuity =
-				IsWrapDiscontinuity(entry.media_sequence, entry.plan_ordinal, n);
+				IsWrapDiscontinuity(own, entry.plan_ordinal, n) || (origin.item_boundary && own == 0);
 			newest_first.push_back(entry);
 
 			if (cur.ord > 0)
@@ -111,6 +116,10 @@ namespace segment_cache
 		if (_window.empty() == false)
 		{
 			_media_sequence_start = _window.front().media_sequence;
+			const int64_t first_own = _media_sequence_start - origin.msn_base;
+			_discontinuity_sequence = origin.disc_base +
+									  WrapDiscontinuitySequenceBefore(first_own, n) +
+									  ((origin.item_boundary && first_own > 0) ? 1 : 0);
 		}
 	}
 }  // namespace segment_cache
