@@ -72,6 +72,11 @@ namespace pvd
 		// Restart demux pacing at "now". Wall time spent idle (or blocked) must not
 		// become a debt the pump repays by bursting packets at demux speed.
 		void ReanchorPumpPacing();
+		// Registered cache session, only if it belongs to this item. Right after an
+		// item change the registry still holds the previous file's session until
+		// the async Open finishes; ticking it with the new item's timeline would
+		// rewind its playhead (and HLS/LLHLS MEDIA-SEQUENCE).
+		std::shared_ptr<segment_cache::SourceSession> FindCacheSessionFor(const std::shared_ptr<Schedule::Item> &item) const;
 
 		// Wall-clock cache playhead: while IsCacheServeEnabled, HLS/LLHLS MSN must
 		// advance at 1x wall even if demux bursts after a WebRTC seek.

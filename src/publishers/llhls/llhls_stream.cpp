@@ -1119,15 +1119,12 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 	}
 
 	const auto &plan = session->GetPlan();
-	const size_t plan_size = plan.segments.size();
 	const ov::String map_uri = GetInitializationSegmentName(track_id);
 	const int64_t item_duration_ms = std::max<int64_t>(1, session->GetItemDurationMs());
 	const int64_t elapsed_ms = session->GetElapsedMs();
 	const int64_t now_ms = ov::Time::GetTimestampInMs();
 	const int64_t plan_origin_dts = plan.segments.front().start_dts;
-	const int64_t first_msn = window.front().media_sequence;
-	const int64_t disc_seq =
-		segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
+	const int64_t disc_seq = driver.GetDiscontinuitySequence();
 
 	// Idle playlists are fully deterministic from the cache window. PRELOAD-HINT
 	// would point at the next part and block LL-HLS clients until playhead moves.
@@ -1146,9 +1143,7 @@ bool LLHlsStream::SyncIdleChunklistIfEnabled(int32_t track_id)
 		const auto &entry = window[wi];
 		const auto seq = static_cast<uint32_t>(entry.media_sequence);
 		const bool is_live_edge = (wi + 1 == window.size());
-		const int64_t loop = plan_size > 0
-								 ? entry.media_sequence / static_cast<int64_t>(plan_size)
-								 : 0;
+		const int64_t loop = entry.loop;
 
 		chunklist->CreateSegmentInfo(LLHlsChunklist::SegmentInfo(seq, GetSegmentName(track_id, entry.media_sequence)));
 
@@ -1337,10 +1332,9 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::G
 		{
 			// Client GET implies demand — refresh the hot window (not inside Get*).
 			session->MaybeWarmPlayheadWindow(24, 2000);
-			const size_t plan_size = session->GetPlan().segments.size();
-			if (plan_size > 0 && segment_number >= 0)
+			size_t ordinal = 0;
+			if (session->ResolveSequence(segment_number, ordinal))
 			{
-				const size_t ordinal = static_cast<size_t>(segment_number) % plan_size;
 				auto cached = session->GetFmp4Segment(track->GetMediaType(), ordinal);
 				if (cached != nullptr)
 				{
@@ -1380,10 +1374,9 @@ std::tuple<LLHlsStream::RequestResult, std::shared_ptr<ov::Data>> LLHlsStream::G
 		{
 			session->MaybeWarmPlayheadWindow(24, 2000);
 			const auto &plan = session->GetPlan();
-			const size_t plan_size = plan.segments.size();
-			if (plan_size > 0)
+			size_t seg_ord = 0;
+			if (session->ResolveSequence(segment_number, seg_ord))
 			{
-				const size_t seg_ord = static_cast<size_t>(segment_number) % plan_size;
 				const auto &seg = plan.segments[seg_ord];
 				if (seg.parts.empty() == false &&
 					static_cast<size_t>(partial_number) < seg.parts.size())

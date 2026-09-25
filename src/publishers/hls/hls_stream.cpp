@@ -1353,7 +1353,6 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 	// time across loops (media DTS alone would jump backward on wrap).
 	playlist->SetWallclockOffset(ov::Time::GetTimestampInMs() - session->GetElapsedMs());
 
-	const size_t plan_size = session->GetPlan().segments.size();
 	const int64_t item_ms = std::max<int64_t>(1, session->GetItemDurationMs());
 
 	// Cache segments are cut by the plan (keyframe-aligned, may exceed this
@@ -1366,20 +1365,15 @@ bool HlsStream::SyncIdlePlaylistIfEnabled(const ov::String &variant_name, const 
 		}
 		playlist->RaiseTargetDuration(static_cast<size_t>(std::llround(static_cast<double>(max_dts) / 90000.0)));
 	}
-	const int64_t first_msn = window.front().media_sequence;
-	const int64_t disc_seq =
-		segment_cache::WrapDiscontinuitySequenceBefore(first_msn, plan_size);
+	const int64_t disc_seq = driver.GetDiscontinuitySequence();
 
 	std::vector<std::shared_ptr<base::modules::Segment>> idle_segments;
 	idle_segments.reserve(window.size());
 
 	for (const auto &entry : window)
 	{
-		const int64_t loop = plan_size > 0
-								 ? entry.media_sequence / static_cast<int64_t>(plan_size)
-								 : 0;
 		// Shift DTS by whole loops so PDT (dts + wallclock_offset) stays monotonic.
-		const int64_t abs_start_dts = entry.start_dts + loop * item_ms * 90;
+		const int64_t abs_start_dts = entry.start_dts + entry.loop * item_ms * 90;
 		auto segment =
 			std::make_shared<mpegts::Segment>(entry.media_sequence, abs_start_dts, entry.duration_ms);
 		segment->SetUrl(GetSegmentName(variant_name, static_cast<uint32_t>(entry.media_sequence)));
@@ -1409,10 +1403,9 @@ std::tuple<HlsStream::RequestResult, std::shared_ptr<const ov::Data>> HlsStream:
 				// Client GET implies demand — keep the live window hot so HLS does
 				// not stall on cold rematerialize (idle loop does not warm).
 				session->MaybeWarmPlayheadWindow(24, 2000);
-				const size_t plan_size = session->GetPlan().segments.size();
-				if (plan_size > 0)
+				size_t ordinal = 0;
+				if (session->ResolveSequence(number, ordinal))
 				{
-					const size_t ordinal = static_cast<size_t>(number) % plan_size;
 					auto cached = session->GetHlsTsSegment(ordinal);
 					if (cached != nullptr)
 					{

@@ -178,3 +178,77 @@ TEST(SegmentCacheIdlePlaylist, WindowBridgesLoopWrap)
 		}
 	}
 }
+
+TEST(SegmentCacheIdlePlaylist, SequenceContinuesAcrossItems)
+{
+	ov::String fixture = "/tmp/ome_segcache_fixture.mp4";
+	ASSERT_TRUE(EnsureTinyFixture(fixture));
+
+	segment_cache::PackagerFingerprint fp;
+	fp.format_id = 2;
+	fp.target_duration_ms = 1000;
+	fp.chunk_duration_ms = 500;
+
+	const ov::String stream = "idle_seq_continuity_test";
+	auto &registry = segment_cache::SessionRegistry::GetInstance();
+	registry.Remove(stream);
+
+	// Item A: first session for the stream keeps the plain numbering.
+	auto a = segment_cache::SourceSession::Open(fixture, fp);
+	ASSERT_NE(a, nullptr);
+	const size_t plan_size = a->GetPlan().segments.size();
+	ASSERT_GE(plan_size, 3u);
+	a->SetElapsedMs(1500);
+	registry.Put(stream, a);
+	const auto a_head = a->ResolvePlayhead(a->GetElapsedMs());
+	const int64_t a_edge = static_cast<int64_t>(a_head.segment_ordinal);
+	ASSERT_GE(a_edge, 1);
+
+	// Item B replaces A: numbering continues after A's playhead.
+	auto b = segment_cache::SourceSession::Open(fixture, fp);
+	ASSERT_NE(b, nullptr);
+	b->SetElapsedMs(0);
+	registry.Put(stream, b);
+	const auto &origin = b->GetSequenceOrigin();
+	EXPECT_EQ(origin.msn_base, a_edge + 1);
+	EXPECT_EQ(origin.disc_base, 0);
+	EXPECT_TRUE(origin.item_boundary);
+
+	segment_cache::IdlePlaylistDriver::Config cfg;
+	cfg.window_segments = 1;
+	segment_cache::IdlePlaylistDriver driver(b, cfg);
+	driver.SetEpochElapsedMs(0);
+	ASSERT_EQ(driver.GetWindow().size(), 1u);
+	EXPECT_EQ(driver.GetWindow().back().media_sequence, a_edge + 1);
+	EXPECT_TRUE(driver.GetWindow().back().discontinuity);
+	EXPECT_EQ(driver.GetDiscontinuitySequence(), 0);
+
+	// Once the boundary segment scrolls out, DISC-SEQ counts it.
+	driver.SetEpochElapsedMs(1500);
+	EXPECT_GT(driver.GetWindow().front().media_sequence, a_edge + 1);
+	EXPECT_FALSE(driver.GetWindow().front().discontinuity);
+	EXPECT_EQ(driver.GetDiscontinuitySequence(), 1);
+
+	// GETs for A's numbers no longer map onto B's plan.
+	size_t ordinal = 0;
+	EXPECT_FALSE(b->ResolveSequence(a_edge, ordinal));
+	ASSERT_TRUE(b->ResolveSequence(a_edge + 2, ordinal));
+	EXPECT_EQ(ordinal, 1u);
+
+	// Item C after a Remove (e.g. a non-cached item in between) still continues,
+	// and B's wrap is counted as a discontinuity.
+	b->SetElapsedMs(b->GetItemDurationMs() + 100);
+	const auto b_head = b->ResolvePlayhead(b->GetElapsedMs());
+	ASSERT_EQ(b_head.loop_count, 1u);
+	registry.Remove(stream);
+	auto c = segment_cache::SourceSession::Open(fixture, fp);
+	ASSERT_NE(c, nullptr);
+	registry.Put(stream, c);
+	const int64_t b_edge = origin.msn_base + static_cast<int64_t>(plan_size) +
+						   static_cast<int64_t>(b_head.segment_ordinal);
+	EXPECT_EQ(c->GetSequenceOrigin().msn_base, b_edge + 1);
+	// B's boundary + B's wrap
+	EXPECT_EQ(c->GetSequenceOrigin().disc_base, 2);
+
+	registry.Remove(stream);
+}
