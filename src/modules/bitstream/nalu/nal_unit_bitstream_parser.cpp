@@ -1,5 +1,7 @@
 #include "nal_unit_bitstream_parser.h"
 
+#include <algorithm>
+
 NalUnitBitstreamParser::NalUnitBitstreamParser(const uint8_t *bitstream, size_t length)
 	: BitReader(bitstream, length)
 {
@@ -22,42 +24,44 @@ bool NalUnitBitstreamParser::ReadU32(uint32_t &value)
 
 bool NalUnitBitstreamParser::ReadUEV(uint32_t &value)
 {
-	value = 0;
-    int zero_bit_count = 0;
-    uint8_t bit;
-    while (true)
-    {
-        if (ReadBit(bit) == false)
-        {
-            return false;
-        }
-		
-        if (bit == 0)
-        {
-            zero_bit_count++;
-        }
-        else
-        {
-            break;
-        }
-    }
+	value			   = 0;
+	int zero_bit_count = 0;
+	uint8_t bit;
 
-    if (zero_bit_count > 0)
-    {
-        uint32_t rest;
-        if (ReadBits(zero_bit_count, rest) == false)
-        {
-            return false;
-        }
+	while (true)
+	{
+		if (ReadBit(bit) == false)
+		{
+			return false;
+		}
 
-        value = (1 << zero_bit_count) - 1 + rest;
-    }
-    else
-    {
-        value = 0;
-    }
+		if (bit == 0)
+		{
+			// 31 leading zeros already put codeNum at 2^32 - 2, the maximum any `ue(v)` element takes.
+			// Refusing as the run is counted avoids walking a longer one first.
+			if (++zero_bit_count > 31)
+			{
+				return false;
+			}
+		}
+		else
+		{
+			break;
+		}
+	}
 
-    return true;
+	if (zero_bit_count > 0)
+	{
+		uint32_t rest;
+		if (ReadBits(static_cast<uint8_t>(zero_bit_count), rest) == false)
+		{
+			return false;
+		}
+
+		value = (1U << zero_bit_count) - 1 + rest;
+	}
+
+	return true;
 }
 
 bool NalUnitBitstreamParser::ReadSEV(int32_t &value)
@@ -75,8 +79,22 @@ bool NalUnitBitstreamParser::ReadSEV(int32_t &value)
 
 bool NalUnitBitstreamParser::Skip(uint32_t count)
 {
-    uint64_t dummy;
-	return ReadBits(count, dummy);
+	// `ReadBits()` takes the width as a `uint8_t` and rejects a width wider than its output.
+	// Anything larger is consumed in 64 bit steps.
+	while (count > 0)
+	{
+		const auto step = static_cast<uint8_t>(std::min<uint32_t>(count, 64));
+
+		uint64_t dummy;
+		if (ReadBits(step, dummy) == false)
+		{
+			return false;
+		}
+
+		count -= step;
+	}
+
+	return true;
 }
 
 void NalUnitBitstreamParser::NextPosition()
