@@ -14,12 +14,16 @@ namespace segment_cache
 	struct IdlePlaylistEntry
 	{
 		size_t plan_ordinal = 0;
+		// Published MEDIA-SEQUENCE (session msn_base + loop * plan_size + ordinal).
 		int64_t media_sequence = 0;
+		// Loop of the item this entry belongs to (for DTS / PDT across wraps).
+		int64_t loop = 0;
 		int64_t start_dts = 0;
 		int64_t end_dts = 0;
 		double duration_ms = 0;
 		size_t part_count = 0;
-		// True when this entry is the first segment of loop k>=1 (file wrap).
+		// True for the first segment of loop k>=1 (file wrap) and for the first
+		// segment of an item that followed another one (item boundary).
 		bool discontinuity = false;
 	};
 
@@ -59,6 +63,10 @@ namespace segment_cache
 		// Media sequence of the oldest segment still in the window.
 		int64_t GetMediaSequenceStart() const { return _media_sequence_start; }
 
+		// EXT-X-DISCONTINUITY-SEQUENCE for the window: discontinuities (earlier
+		// items, item boundary, wraps) before its first segment.
+		int64_t GetDiscontinuitySequence() const { return _discontinuity_sequence; }
+
 		// Segments currently in the playlist window (oldest → newest).
 		const std::vector<IdlePlaylistEntry> &GetWindow() const { return _window; }
 
@@ -73,6 +81,7 @@ namespace segment_cache
 		IdlePlayhead _playhead;
 		int64_t _elapsed_ms = 0;
 		int64_t _media_sequence_start = 0;
+		int64_t _discontinuity_sequence = 0;
 		std::vector<IdlePlaylistEntry> _window;
 	};
 }  // namespace segment_cache

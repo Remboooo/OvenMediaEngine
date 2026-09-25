@@ -377,6 +377,16 @@ namespace pvd
 		return (now - zero_since) < grace_ms;
     }
 
+    std::shared_ptr<segment_cache::SourceSession> ScheduledStream::FindCacheSessionFor(const std::shared_ptr<Schedule::Item> &item) const
+    {
+		auto session = segment_cache::SessionRegistry::GetInstance().Find(GetName());
+		if (session == nullptr || item == nullptr || session->GetSourcePath() != item->_file_path)
+		{
+			return nullptr;
+		}
+		return session;
+    }
+
     void ScheduledStream::ReanchorPumpPacing()
     {
 		_global_track_offset_us_map.clear();
@@ -937,7 +947,7 @@ namespace pvd
 		_media_pump_running.store(true);
 		// Keep / enable cache-serve for HLS/LLHLS even when demux runs for WebRTC.
 		// Playhead was anchored in PrepareFilePlayback when SegmentCache is on.
-		if (auto session = segment_cache::SessionRegistry::GetInstance().Find(GetName()))
+		if (auto session = FindCacheSessionFor(item))
 		{
 			segment_cache::SessionRegistry::GetInstance().SetCacheServeEnabled(GetName(), true);
 			if (_cache_playhead_anchor_mono_ms < 0)
@@ -1153,7 +1163,7 @@ namespace pvd
             _current_item_position_ms = single_file_duration_ms;
             lock.unlock();
 
-			if (auto session = segment_cache::SessionRegistry::GetInstance().Find(GetName()))
+			if (auto session = FindCacheSessionFor(item))
 			{
 				if (segment_cache::SessionRegistry::GetInstance().IsCacheServeEnabled(GetName()))
 				{
