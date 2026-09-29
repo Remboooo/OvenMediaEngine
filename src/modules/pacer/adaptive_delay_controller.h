@@ -12,7 +12,7 @@
 
 // Stream-scoped adaptive smoothing-delay controller.
 //
-// Each FramePacer records its observed lateness (arrival vs. PTS-anchored
+// Each FramePacer records its observed lateness (arrival vs. DTS-anchored
 // expected time) into this shared controller. The controller maintains a
 // rolling window of samples across all tracks and exposes a single current
 // delay so that all tracks of a stream stay in lock-step (preserves A/V sync).
