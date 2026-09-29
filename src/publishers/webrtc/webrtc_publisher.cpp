@@ -334,6 +334,19 @@ std::shared_ptr<const SessionDescription> WebRtcPublisher::OnRequestOffer(const 
 		return nullptr;
 	}
 
+	// Browsers' WebRTC H.264 decoders can't play B-frames: in decode order
+	// Chrome shows only keyframes and Firefox drops the B-frames. Refuse
+	// playlists carrying a B-frame track (typically a bypassed source); B-frame
+	// free renditions (e.g. transcodes) of the same stream stay available.
+	auto master_playlist = stream->GetRtcMasterPlaylist(final_file_name);
+	auto bframe_rendition = master_playlist ? master_playlist->GetBframeRendition() : nullptr;
+	if (bframe_rendition != nullptr)
+	{
+		logtw("WebRTC refused for %s/%s/%s: rendition %s has B-frames, which WebRTC players can't decode",
+			  final_vhost_app_name.CStr(), final_stream_name.CStr(), final_file_name.CStr(), bframe_rendition->GetName().CStr());
+		return nullptr;
+	}
+
 	auto transport = final_url->GetQueryValue("transport").UpperCaseString();
 	// ?transport policy (falls back to <DefaultTransport> config when not specified):
 	//   udp      → UDP candidates only
