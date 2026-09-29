@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC decode-order check</title>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<script type="module">
+import { H264OrderChecker } from './h264_order.js';
+
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get('ws');
+
+window.__ORDER__ = { state: 'connecting', mode: null, order: null, rtp: null, error: null };
+const out = window.__ORDER__;
+
+function hookReceiver(receiver) {
+  if ('RTCRtpScriptTransform' in window) {
+    out.mode = 'RTCRtpScriptTransform';
+    const worker = new Worker('./webrtc_order_worker.js', { type: 'module' });
+    worker.onmessage = (e) => { out.order = e.data; };
+    receiver.transform = new RTCRtpScriptTransform(worker, {});
+    return;
+  }
+  out.mode = 'createEncodedStreams';
+  const checker = new H264OrderChecker();
+  out.order = checker.stats;
+  const { readable, writable } = receiver.createEncodedStreams();
+  readable
+    .pipeThrough(new TransformStream({
+      transform(frame, controller) {
+        checker.onFrame(new Uint8Array(frame.data), frame.timestamp);
+        controller.enqueue(frame);
+      },
+    }))
+    .pipeTo(writable);
+}
+
+const ws = new WebSocket(wsUrl);
+let pc = null;
+
+ws.onopen = () => ws.send(JSON.stringify({ command: 'request_offer' }));
+ws.onerror = () => { out.error = 'websocket error'; };
+ws.onclose = () => { if (out.state !== 'playing') out.error ??= 'websocket closed'; };
+
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.error) {
+    out.error = `signalling ${msg.code}: ${msg.error}`;
+    return;
+  }
+  if (msg.command !== 'offer') return;
+  try {
+    const legacy = !('RTCRtpScriptTransform' in window);
+    const config = legacy ? { encodedInsertableStreams: true } : {};
+    if (params.get('relay') === '1') {
+      // Force OME's embedded TURN (TcpRelay), e.g. for browsers that won't pair loopback host candidates.
+      config.iceServers = msg.iceServers ?? [];
+      config.iceTransportPolicy = 'relay';
+    }
+    pc = new RTCPeerConnection(config);
+    pc.ontrack = (e) => {
+      if (e.track.kind === 'video') {
+        hookReceiver(e.receiver);
+        document.getElementById('v').srcObject = e.streams[0] ?? new MediaStream([e.track]);
+      } else if (legacy) {
+        // With encodedInsertableStreams every receiver must be piped or it stalls.
+        const { readable, writable } = e.receiver.createEncodedStreams();
+        readable.pipeTo(writable);
+      }
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        (out.localCandidates ??= []).push(e.candidate.candidate);
+        ws.send(JSON.stringify({ command: 'candidate', id: msg.id, peer_id: msg.peer_id, candidates: [e.candidate] }));
+      }
+    };
+    pc.oniceconnectionstatechange = () => { out.ice = pc.iceConnectionState; };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') out.state = 'playing';
+      if (pc.connectionState === 'failed') out.error = 'peer connection failed';
+    };
+
+    await pc.setRemoteDescription(msg.sdp);
+    for (const c of msg.candidates ?? []) await pc.addIceCandidate(c);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ command: 'answer', id: msg.id, peer_id: msg.peer_id, sdp: answer }));
+    // Negotiated video payloads, for diagnosing codec/profile mismatches.
+    out.answerVideo = answer.sdp.split('\r\n').filter((l) => /^(m=video|a=rtpmap|a=fmtp)/.test(l) && !/rtx|red|ulpfec|opus/i.test(l));
+    out.offerVideo = msg.sdp.sdp.split('\r\n').filter((l) => /^(m=video|a=fmtp:\d+ .*profile|a=candidate)/.test(l));
+    out.remoteCandidates = (msg.candidates ?? []).map((c) => c.candidate);
+    out.iceServers = msg.iceServers ?? null;
+  } catch (e) {
+    out.error = String(e);
+  }
+};
+
+setInterval(async () => {
+  if (!pc) return;
+  const stats = await pc.getStats();
+  stats.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') {
+      out.rtp = {
+        framesReceived: s.framesReceived,
+        framesDecoded: s.framesDecoded,
+        framesDropped: s.framesDropped,
+        packetsLost: s.packetsLost,
+        nackCount: s.nackCount,
+        pliCount: s.pliCount,
+        freezeCount: s.freezeCount,
+        decoder: s.decoderImplementation,
+        codec: stats.get(s.codecId)?.sdpFmtpLine ?? stats.get(s.codecId)?.mimeType,
+      };
+    }
+  });
+}, 1000);
+</script>
+</body>
+</html>
