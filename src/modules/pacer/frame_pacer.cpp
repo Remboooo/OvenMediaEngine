@@ -79,14 +79,17 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 
 		// Anchor reset on first push or after long idle. Uses current frame
 		// as a provisional anchor; calibration shifts it to the median.
+		// Pace on DTS, not PTS: with B-frames PTS is not monotonic in decode
+		// order, and PTS-derived targets would reorder frames on the wire.
+		int64_t dts_us = (_timebase_den == 0)
+							 ? 0
+							 : static_cast<int64_t>(static_cast<double>(packet->GetDts()) *
+													static_cast<double>(_timebase_num) * 1000000.0 /
+													static_cast<double>(_timebase_den));
+
 		if (!_anchor_set || (now - _last_push) > kAnchorIdleResetThreshold)
 		{
-			int64_t pts_us = (_timebase_den == 0)
-								 ? 0
-								 : static_cast<int64_t>(static_cast<double>(packet->GetPts()) *
-														static_cast<double>(_timebase_num) * 1000000.0 /
-														static_cast<double>(_timebase_den));
-			_anchor_pts_us			= pts_us;
+			_anchor_dts_us			= dts_us;
 			_anchor_arrival			= now;
 			_anchor_set				= true;
 			_anchor_calibrated		= false;
@@ -95,15 +98,10 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 		}
 		_last_push = now;
 
-		int64_t pts_us = (_timebase_den == 0)
-							 ? 0
-							 : static_cast<int64_t>(static_cast<double>(packet->GetPts()) *
-													static_cast<double>(_timebase_num) * 1000000.0 /
-													static_cast<double>(_timebase_den));
-		int64_t pts_diff_us = pts_us - _anchor_pts_us;
+		int64_t dts_diff_us = dts_us - _anchor_dts_us;
 
 		// Lateness vs anchor-based expected arrival (in ms)
-		auto expected_arrival = _anchor_arrival + std::chrono::microseconds(pts_diff_us);
+		auto expected_arrival = _anchor_arrival + std::chrono::microseconds(dts_diff_us);
 		int64_t lateness_ms	  = std::chrono::duration_cast<std::chrono::milliseconds>(now - expected_arrival).count();
 
 		uint32_t effective_delay_ms = _adaptive_controller
@@ -129,7 +127,7 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 				warn_drift_track			= packet->GetTrackId();
 			}
 
-			_anchor_pts_us			= pts_us;
+			_anchor_dts_us			= dts_us;
 			_anchor_arrival			= now;
 			delta_ms				= effective_delay_ms;
 			lateness_ms				= 0;
@@ -169,7 +167,7 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 					_anchor_arrival += std::chrono::milliseconds(median_ms);
 
 					// Re-evaluate the current frame against the calibrated anchor.
-					expected_arrival = _anchor_arrival + std::chrono::microseconds(pts_diff_us);
+					expected_arrival = _anchor_arrival + std::chrono::microseconds(dts_diff_us);
 					lateness_ms		 = std::chrono::duration_cast<std::chrono::milliseconds>(now - expected_arrival).count();
 					target			 = expected_arrival + std::chrono::milliseconds(effective_delay_ms);
 					delta_ms		 = std::chrono::duration_cast<std::chrono::milliseconds>(target - now).count();
@@ -198,7 +196,7 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 		// Post-calibration drift is a genuine anomaly (warning).
 		if (warn_drift_was_calibrated)
 		{
-			logtw("[%s] Anchor drift reset on track %u (lateness=%lldms, computed delta=%lldms, current delay=%ums) — PTS clock may be running faster than wall clock or catch-up burst pushed",
+			logtw("[%s] Anchor drift reset on track %u (lateness=%lldms, computed delta=%lldms, current delay=%ums) — DTS clock may be running faster than wall clock or catch-up burst pushed",
 				  _stream_id.CStr(),
 				  warn_drift_track,
 				  static_cast<long long>(warn_drift_lateness),
@@ -235,14 +233,34 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 		}
 	}
 
+	// Each scheduled task sends the oldest pending frame rather than the frame
+	// it was created for, so frames always leave in push (decode) order even
+	// if millisecond rounding or an anchor reset makes a later frame's target
+	// time earlier than its predecessor's.
+	{
+		ov::LockGuard<ov::Mutex> lock(_pending->mutex);
+		_pending->packets.push_back(packet);
+	}
+
 	// Capture by value so the lambda is independent of FramePacer lifetime.
 	auto dispatcher_copy = _dispatcher;
-	auto packet_copy	 = packet;
+	auto pending		 = _pending;
 	_scheduler->Push(
-		[dispatcher_copy, packet_copy](void *) -> ov::DelayQueueAction {
+		[dispatcher_copy, pending](void *) -> ov::DelayQueueAction {
+			std::shared_ptr<MediaPacket> next;
+			{
+				ov::LockGuard<ov::Mutex> lock(pending->mutex);
+				if (pending->packets.empty())
+				{
+					return ov::DelayQueueAction::Stop;
+				}
+				next = pending->packets.front();
+				pending->packets.pop_front();
+			}
+
 			if (dispatcher_copy)
 			{
-				dispatcher_copy(packet_copy);
+				dispatcher_copy(next);
 			}
 			return ov::DelayQueueAction::Stop;
 		},

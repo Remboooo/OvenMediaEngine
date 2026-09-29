@@ -834,7 +834,7 @@ bool RtcStream::SendBufferedPackets()
 		// Bypass the Pacer for buffered packets. The buffer accumulates
 		// frames during the Started→Prepared window so the first frame can be
 		// delivered properly once playback begins; routing them through the
-		// Pacer would let the scheduler dispatch them on its own PTS-based
+		// Pacer would let the scheduler dispatch them on its own DTS-based
 		// timeline, decoupled from the Prepared transition.
 		if (media_packet->GetMediaType() == cmn::MediaType::Video)
 		{
