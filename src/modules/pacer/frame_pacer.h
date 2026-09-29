@@ -10,21 +10,24 @@
 #include <base/ovlibrary/ovlibrary.h>
 
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <vector>
 
 #include "adaptive_delay_controller.h"
 
-// Per-track PTS-anchored sender-side frame pacer.
+// Per-track DTS-anchored sender-side frame pacer.
 //
 // Schedules each frame's dispatch on a shared ov::DelayQueue (one worker
 // thread shared across all tracks of a stream). Frames may arrive in bursts
 // due to encoder delays, network conditions, or sender-side pacing; without
 // smoothing, WebRTC players render them at the burst rate, causing uneven
-// playback. This pacer dispatches each frame at its PTS-derived expected
+// playback. This pacer dispatches each frame at its DTS-derived expected
 // time instead:
-//   target = anchor_arrival + (frame.pts - anchor.pts) + delay
+//   target = anchor_arrival + (frame.dts - anchor.dts) + delay
+// DTS is used (not PTS) so B-frame content keeps its decode order, and frames
+// are always dispatched in push order regardless of their computed targets.
 // The first frame after a long idle (or the first ever) establishes a fresh
 // anchor.
 //
@@ -67,9 +70,18 @@ private:
 	std::shared_ptr<ov::DelayQueue> _scheduler;
 	DispatchFn _dispatcher;
 
+	// Frames waiting for dispatch, in push order. Shared with the scheduled
+	// tasks so they stay valid if the FramePacer is destroyed first.
+	struct PendingQueue
+	{
+		ov::Mutex mutex;
+		std::deque<std::shared_ptr<MediaPacket>> packets OV_GUARDED_BY(mutex);
+	};
+	std::shared_ptr<PendingQueue> _pending = std::make_shared<PendingQueue>();
+
 	ov::Mutex _mu;
 	bool _anchor_set OV_GUARDED_BY(_mu) = false;
-	int64_t _anchor_pts_us OV_GUARDED_BY(_mu) = 0;
+	int64_t _anchor_dts_us OV_GUARDED_BY(_mu) = 0;
 	std::chrono::steady_clock::time_point _anchor_arrival OV_GUARDED_BY(_mu);
 	std::chrono::steady_clock::time_point _last_push OV_GUARDED_BY(_mu);
 	std::chrono::steady_clock::time_point _last_drift_warn OV_GUARDED_BY(_mu);
