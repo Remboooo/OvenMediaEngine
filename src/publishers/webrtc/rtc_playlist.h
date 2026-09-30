@@ -276,26 +276,6 @@ public:
 		return _payload_track_map;
 	}
 
-	// Returns the first rendition whose video track has B-frames, or nullptr.
-	// Browsers' WebRTC decoders can't play B-frames (see WebRtcPublisher::OnRequestOffer).
-	std::shared_ptr<const RtcRendition> GetBframeRendition() const
-	{
-		for (const auto &[key, playlist] : _playlist_map)
-		{
-			for (const auto &[name, rendition] : playlist->GetRenditions())
-			{
-				auto video_track = rendition->GetVideoTrack();
-				auto stats		 = video_track ? video_track->GetStats() : nullptr;
-				if (stats != nullptr && stats->HasBframes())
-				{
-					return rendition;
-				}
-			}
-		}
-
-		return nullptr;
-	}
-
 	// Get Playlist
 	std::shared_ptr<const RtcPlaylist> GetPlaylist(cmn::MediaCodecId video_codec_id, cmn::MediaCodecId audio_codec_id) const
 	{

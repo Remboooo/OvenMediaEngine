@@ -44,7 +44,6 @@ public:
 	//--------------------------------------------------------------------
 
 	std::shared_ptr<const SessionDescription> GetSessionDescription(const ov::String &file_name);
-	std::shared_ptr<const RtcMasterPlaylist> GetRtcMasterPlaylist(const ov::String &file_name);
 	std::shared_ptr<const RtcPlaylist> GetRtcPlaylist(const ov::String &file_name, cmn::MediaCodecId video_codec_id, cmn::MediaCodecId audio_codec_id);
 
 	void SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet) override;
@@ -66,6 +65,7 @@ private:
 
 	std::shared_ptr<SessionDescription> CreateSessionDescription(const ov::String &file_name = "");
 
+	std::shared_ptr<const RtcMasterPlaylist> GetRtcMasterPlaylist(const ov::String &file_name);
 	std::shared_ptr<RtcMasterPlaylist> CreateRtcMasterPlaylist(const ov::String &file_name);
 
 	std::shared_ptr<MediaDescription> MakeVideoDescription() const;
