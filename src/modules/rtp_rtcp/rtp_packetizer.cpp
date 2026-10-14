@@ -14,8 +14,8 @@ RtpPacketizer::RtpPacketizer(const std::shared_ptr<RtpPacketizerInterface> &sess
 
 	_audio_configured = false;
 	_timestamp_offset = (uint32_t)rand();
-	_sequence_number = (uint16_t)rand();
-	_red_sequence_number = (uint16_t)rand();
+	_sequence_state->sequence_number = (uint16_t)rand();
+	_sequence_state->red_sequence_number = (uint16_t)rand();
 	_ulpfec_enabled = false;
 }
 
@@ -226,12 +226,16 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 		}
 
 		_rtp_packet_count ++;
-		_stream->OnRtpPacketized(packet);
-
-		// RED First
-		if(_ulpfec_enabled)
+		// When ULPFEC/RED is enabled the session only accepts RED (or FEC)
+		// payloads — fan-out of the raw RTP packet is wasted work and on 4K
+		// bypass doubles DelayQueue/send pressure enough to freeze.
+		if (_ulpfec_enabled)
 		{
 			GenerateRedAndFecPackets(packet);
+		}
+		else
+		{
+			_stream->OnRtpPacketized(packet);
 		}
 	}
 
@@ -240,7 +244,9 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 
 bool RtpPacketizer::GenerateRedAndFecPackets(const std::shared_ptr<RtpPacket> &packet)
 {
-	// Send RED
+	// Media RED first, then FEC. Encode/XOR on the marker packet used to run
+	// before OnRtpPacketized of that media packet — delaying the last slice of
+	// every 4K frame by the full FEC cost and opening decode gaps.
 	auto red_packet = PackageAsRed(packet);
 
 	// Separate the sequence number of the RED packet from RTP packet.
@@ -359,13 +365,14 @@ std::shared_ptr<RtpPacket> RtpPacketizer::AllocatePacket()
 
 bool RtpPacketizer::AssignSequenceNumber(RtpPacket *packet, bool red)
 {
-	if(!red)
+	std::lock_guard<std::mutex> lock(_sequence_state->mutex);
+	if (!red)
 	{
-		packet->SetSequenceNumber(_sequence_number++);
+		packet->SetSequenceNumber(_sequence_state->sequence_number++);
 	}
 	else
 	{
-		packet->SetSequenceNumber(_red_sequence_number++);
+		packet->SetSequenceNumber(_sequence_state->red_sequence_number++);
 	}
 
 	return true;

@@ -186,6 +186,7 @@ void AdaptiveDelayController::Recompute()
 	int desired_ms = static_cast<int>(std::max<int64_t>(worst_pvalue, 0)) + kMarginMs;
 	desired_ms	   = std::clamp(desired_ms, _min_delay_ms, _max_delay_ms);
 
+	const int prev_ms = _current_delay_ms;
 	if (desired_ms >= _current_delay_ms)
 	{
 		_current_delay_ms = desired_ms;
@@ -195,6 +196,15 @@ void AdaptiveDelayController::Recompute()
 		double smoothed	  = kRelaxAlpha * static_cast<double>(desired_ms) +
 							(1.0 - kRelaxAlpha) * static_cast<double>(_current_delay_ms);
 		_current_delay_ms = std::clamp(static_cast<int>(smoothed), _min_delay_ms, _max_delay_ms);
+	}
+
+	// Surface delay moves: sudden increases are the packetsLost=0 freeze signature.
+	const int delta = _current_delay_ms - prev_ms;
+	if (delta >= 10 || delta <= -20)
+	{
+		logtw("[%s] AdaptiveDelay %d→%dms (desired=%d p99=%lld samples=%zu)",
+			  _stream_id.CStr(), prev_ms, _current_delay_ms, desired_ms,
+			  static_cast<long long>(worst_pvalue), _samples.size());
 	}
 }
 

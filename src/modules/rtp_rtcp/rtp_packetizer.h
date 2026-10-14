@@ -7,6 +7,8 @@
 
 #include "base/mediarouter/media_buffer.h"
 #include <memory>
+#include <mutex>
+#include <thread>
 
 #include "rtp_header_extension/rtp_header_extensions.h"
 #include "rtp_header_extension/rtp_header_extension_framemarking.h"
@@ -25,6 +27,7 @@ public:
 	// skips ULPFEC parity packets — needed for high-bitrate passthrough where FEC
 	// roughly doubles encode/send work on the pace-group thread.
 	void SetUlpfec(uint8_t red_payload_type, uint8_t ulpfec_payload_type, bool generate_fec = true);
+	void SetGenerateFec(bool generate_fec) { _ulpfec_generate_fec = generate_fec; }
 	void SetTrackId(uint32_t track_id);
 	void SetPayloadType(uint8_t payload_type);
 	void SetSSRC(uint32_t ssrc);
@@ -79,9 +82,14 @@ private:
 	uint32_t _ssrc;
 	uint8_t _payload_type;
 	std::vector<uint32_t> _csrcs;
-	// Sequence Number
-	uint16_t _sequence_number;
-	uint16_t _red_sequence_number;
+	// Sequence Number (shared_ptr so async FEC workers outlive briefly).
+	struct SequenceState
+	{
+		std::mutex mutex;
+		uint16_t sequence_number = 0;
+		uint16_t red_sequence_number = 0;
+	};
+	std::shared_ptr<SequenceState> _sequence_state = std::make_shared<SequenceState>();
 
 	bool _ulpfec_enabled;
 	bool _ulpfec_generate_fec = true;

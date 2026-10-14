@@ -482,7 +482,12 @@ bool WebRtcPublisher::OnAddRemoteDescription(const std::shared_ptr<http::svr::ws
 	}
 
 	auto ice_session_id = _ice_port->IssueUniqueSessionId();
-	auto session		= RtcSession::Create(Publisher::GetSharedPtrAs<WebRtcPublisher>(), application, stream, final_file_name, offer_sdp, answer_sdp, _ice_port, ice_session_id, ws_session);
+	// ?rendition=Name is applied inside RtcSession::Start before the first
+	// PublishTrackDemand, so the session never briefly demands the playlist's
+	// first (often Bypass) rung. change_rendition after ICE is too late for
+	// multi-viewer soaks — media can already be flowing on Bypass.
+	auto initial_rendition = final_url->GetQueryValue("rendition");
+	auto session		   = RtcSession::Create(Publisher::GetSharedPtrAs<WebRtcPublisher>(), application, stream, final_file_name, offer_sdp, answer_sdp, _ice_port, ice_session_id, ws_session, initial_rendition);
 	if (session != nullptr)
 	{
 		session->SetRequestedUrl(requested_url);
