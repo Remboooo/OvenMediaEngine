@@ -88,17 +88,39 @@ Everything else can ship as better defaults without new user-facing flags.
 
 ---
 
-## Remaining work to fully PASS all-three
+## Remaining freezes (investigation after keepers commit)
 
-On this **4-core E3-1226** box, 4K@~35 Mbps + ULPFEC + RTX history + per-packet
-clone + SRTP for three sessions is still tight (bypass ~56 fps vs 60).
+Not LAN loss, not iperf capacity: Chrome `packetsLost` stays flat while
+`maxGapMs≈250` and `framesReceived` stalls. Seq# is assigned at send time, so
+queue/pace delay looks like freezes without loss.
 
-Likely next wins (not done):
+**What we know**
 
-1. Avoid redundant copies on the hot path (carefully, without breaking ULPFEC/RTX).
-2. Cheaper / adaptive ULPFEC for high-bitrate bypass (or FEC only on keyframes).
-3. More CPU for OME (or pin send threads), or slightly lower Bypass bitrate.
-4. Harness: ignore first 2–3 s startup when scoring freezes (many `freezeEvents` are connect/keyframe ramp).
+| Observation | Implication |
+|-------------|-------------|
+| Bypass alone PASS; 1080+720 PASS; all3 fails on bypass | Coupling / cost on the 4K session under concurrent peers |
+| OvenRtcTester ×3 localhost PASS 60 fps / 0 loss | Server can packetize+send three rungs; Chrome/remote path exposes the gap |
+| `maxGapMs` sticks near 250 ms | ~one 4K keyframe’s worth of copy+SRTP+sendmsg on the per-session send thread |
+| Morning near-miss (~56 fps, freezeCount≈3); later soaks worse | Flaky under host load / leftover `--keep-tabs` sessions; close tabs between runs |
+
+**Tried and rejected (for now)**
+
+1. **Media-before-FEC dual queue** — reordering FEC behind later media did not help (and can starve/blast FEC).
+2. **History-clone + in-place SRTP** — moves deep `Data::Clone` onto the pace thread; Packetize already ~16 ms/frame → worse under-delivery.
+3. **Keyframe-only ULPFEC for bypass** — one near-clean run, then flaky; IDR media burst alone is still ~200 ms of HOL.
+
+**Harness**
+
+`--warmup-s` (default 3) now ignores connect/keyframe ramp when scoring
+(`webrtc_stutter.html` / `webrtc_stutter_cdp.mjs`).
+
+**Likely next wins**
+
+1. Instrument per-keyframe send drain time (`enq→wire`) and pace DelayQueue depth for bypass under all3.
+2. Cheaper send-path copy (or pool) without moving work onto FPg*.
+3. A/B `<JitterBuffer>false` (AdaptiveDelay hold) on dogfood.
+4. Fair OvenRtcTester run with Bypass+opus + 1080p + 720p (script still uses webrtc_default/480p).
+5. NACK early-return bug fixed in tree (retransmit full list).
 
 ---
 

@@ -35,13 +35,15 @@ if [[ "$RELAY" == "1" || "$RELAY" == "true" || "$RELAY" == "yes" ]]; then
 	q="?transport=relay"
 fi
 
-declare -a NAMES=(bypass 1080 480)
+# Playlist URLs (OvenRtcTester has no change_rendition). Prefer dedicated
+# FileName playlists; webrtc_default ≈ first auto rendition (usually Bypass).
+declare -a NAMES=(bypass 1080 720)
 declare -a URLS=(
 	"ws://${HOST}:${PORT}/${APP}/${STREAM}/webrtc_default${q}"
 	"ws://${HOST}:${PORT}/${APP}/${STREAM}/1080p${q}"
-	"ws://${HOST}:${PORT}/${APP}/${STREAM}/480p${q}"
+	"ws://${HOST}:${PORT}/${APP}/${STREAM}/720p${q}"
 )
-declare -a MIN_FPS=("$MIN_FPS_60" "$MIN_FPS_60" "$MIN_FPS_30")
+declare -a MIN_FPS=("$MIN_FPS_60" "$MIN_FPS_60" "$MIN_FPS_60")
 
 LOGDIR=$(mktemp -d /tmp/webrtc_multi_recv.XXXXXX)
 echo "webrtc_multi_recv life=${LIFE}s relay=${RELAY} logdir=${LOGDIR}"
