@@ -112,7 +112,7 @@ The Signalling protocol is defined in a simple way:
 
 ![](../images/webrtc-publishing-signalling.png)
 
-To use a player other than OvenPlayer, implement the signaling protocol shown above.
+To use a player other than OvenPlayer, implement the signaling protocol shown above. After the session is established, clients can send a `change_rendition` command to switch playlist renditions mid-stream. To choose the starting rendition before the first video packets, use the [`?rendition`](webrtc-publishing.md#rendition-query-parameter) query parameter on the signaling URL instead.
 
 ## Streaming
 
@@ -223,7 +223,7 @@ Here is an example play URL for ABR in the playlist settings below. `wss://domai
 
 :::info
 
-Streaming starts from the top rendition of Playlist, and when Auto ABR is true, the server finds the best rendition and switches to it. Alternatively, the user can switch manually by selecting a rendition in the player.
+Streaming starts from the top rendition of Playlist, and when Auto ABR is true, the server finds the best rendition and switches to it. Alternatively, the user can switch manually by selecting a rendition in the player, or start on a specific rendition with the [`?rendition`](webrtc-publishing.md#rendition-query-parameter) query parameter.
 
 :::
 
@@ -435,6 +435,29 @@ If `*` is used as the IP of `<TcpRelay>` and `<IceCandidate>`, all available can
 
 :::
 
+
+### `?rendition` query parameter
+
+The `?rendition` query parameter selects the initial playlist rendition before the first video packets are sent. The value must match a `<Playlist>/<Rendition>/<Name>` in the playlist being played (for example `master` or `auto`).
+
+```
+ws[s]://{OvenMediaEngine Host}[:{Signaling Port}]/{App Name}/{Stream Name}/{Playlist Name}?rendition=720p
+```
+
+Combine with other query parameters as needed:
+
+```
+ws[s]://{OvenMediaEngine Host}[:{Signaling Port}]/{App Name}/{Stream Name}/auto?rendition=Bypass+opus&transport=udp
+```
+
+| Behavior | Detail |
+|---|---|
+| Known name | Session starts on that rendition immediately (no brief spell on the top/first rung). |
+| Unknown name | OvenMediaEngine logs a warning and falls back to the first playlist rendition. |
+| Auto ABR | Explicit `?rendition` disables automatic ABR for that session so the selection sticks. |
+| Mid-session switch | Players can still switch later via the `change_rendition` signaling command (see [Signalling Protocol](webrtc-publishing.md#signalling-protocol)). |
+
+Without `?rendition`, playback still starts from the top rendition of the playlist as described under [Create Playlist for WebRTC ABR](webrtc-publishing.md#create-playlist-for-webrtc-abr).
 
 ### `?transport` query parameter
 

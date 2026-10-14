@@ -222,11 +222,15 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 		}
 
 		_rtp_packet_count ++;
-		// When ULPFEC/RED is enabled the session only accepts RED (or FEC)
-		// payloads — fan-out of the raw RTP packet is wasted work and on 4K
-		// bypass doubles DelayQueue/send pressure enough to freeze.
+		// When ULPFEC/RED is enabled, RED peers only accept RED/FEC payloads.
+		// Skip raw fan-out unless some interested session did not negotiate RED
+		// (otherwise 4K bypass doubles send pressure enough to freeze).
 		if (_ulpfec_enabled)
 		{
+			if (_stream != nullptr && _stream->NeedsRawRtpFanout(_track_id))
+			{
+				_stream->OnRtpPacketized(packet);
+			}
 			GenerateRedAndFecPackets(packet);
 		}
 		else

@@ -27,14 +27,15 @@ using namespace cmn;
 
 // <JitterBuffer>true</JitterBuffer> (see docs/streaming/webrtc-publishing.md)
 // enables a sender-side smoothing hold so bursty ingress is released evenly.
-// We pin Min==Max rather than letting AdaptiveDelay climb: under simultaneous
-// 4K Bypass+ULPFEC + ladder rungs, delay step-ups opened ≥200ms decode gaps
-// (Chrome freezeEvents/freezeCount with packetsLost=0). A fixed 80ms hold still
-// matches the documented "even spacing" behaviour and stays well under a
-// ≤500ms extra E2E latency budget. Packetize always runs on DelayQueue workers
-// regardless of this flag (see PaceGroup).
+// Min is a fixed floor (80ms). Max was previously pinned to Min because under
+// simultaneous 4K Bypass+ULPFEC + ladder rungs, AdaptiveDelay step-ups opened
+// ≥200ms decode gaps (Chrome freezeEvents with packetsLost=0). With hold-from-
+// arrival pacing + async FEC, Min=80/Max=500 passed the all3 soak (freezeCount=0)
+// so the controller can absorb burstier ingress within the ≤500ms extra E2E
+// latency budget. Packetize always runs on DelayQueue workers regardless of
+// this flag (see PaceGroup).
 static constexpr int kPacerMinMs = 80;
-static constexpr int kPacerMaxMs = 80;
+static constexpr int kPacerMaxMs = 500;
 
 /***************************
  SDP Sample
@@ -999,11 +1000,18 @@ bool RtcStream::IsTrackFullyDemanded(uint32_t track_id) const
 	return _fully_demanded_tracks.find(track_id) != _fully_demanded_tracks.end();
 }
 
+bool RtcStream::NeedsRawRtpFanout(uint32_t track_id) const
+{
+	std::shared_lock<std::shared_mutex> lock(_demand_lock);
+	return _tracks_needing_raw_rtp.find(track_id) != _tracks_needing_raw_rtp.end();
+}
+
 void RtcStream::RebuildDemandedTracksUnlocked()
 {
 	_demanded_tracks.clear();
 	_fully_demanded_tracks.clear();
 	_track_interested_sessions.clear();
+	_tracks_needing_raw_rtp.clear();
 	for (const auto &entry : _session_demanded_tracks)
 	{
 		const auto session_id = entry.first;
@@ -1015,10 +1023,18 @@ void RtcStream::RebuildDemandedTracksUnlocked()
 		for (auto track_id : demand.current_track_ids)
 		{
 			_track_interested_sessions[track_id].insert(session_id);
+			if (demand.red_enabled == false)
+			{
+				_tracks_needing_raw_rtp.insert(track_id);
+			}
 		}
 		for (auto track_id : demand.next_track_ids)
 		{
 			_track_interested_sessions[track_id].insert(session_id);
+			if (demand.red_enabled == false)
+			{
+				_tracks_needing_raw_rtp.insert(track_id);
+			}
 		}
 	}
 }

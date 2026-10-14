@@ -72,6 +72,7 @@ public:
 
 	// RtpRtcpPacketizerInterface Implementation
 	bool OnRtpPacketized(std::shared_ptr<RtpPacket> packet) override;
+	bool NeedsRawRtpFanout(uint32_t track_id) const override;
 
 private:
 	void RebuildDemandedTracksUnlocked();
@@ -184,6 +185,9 @@ private:
 	std::unordered_set<uint32_t> _demanded_tracks;
 	// track_id → sessions that currently or pending-next need that track
 	std::unordered_map<uint32_t, std::unordered_set<session_id_t>> _track_interested_sessions;
+	// Tracks where ≥1 interested session has red_enabled=false (needs raw RTP
+	// fan-out alongside RED when Ulpfec is on).
+	std::unordered_set<uint32_t> _tracks_needing_raw_rtp;
 	mutable std::shared_mutex _demand_lock;
 
 	ov::String _default_playlist_name;
