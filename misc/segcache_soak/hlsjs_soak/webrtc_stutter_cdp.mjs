@@ -45,10 +45,12 @@ const app = env('OME_SOAK_APP', 'app');
 const stream = env('OME_SOAK_STREAM', 'stream');
 const playlist = env('OME_SOAK_PLAYLIST', 'auto');
 const durationS = Number(arg('--duration-s', '40'));
+const warmupS = Number(arg('--warmup-s', '3'));
 const maxFreezeEvents = Number(arg('--max-freeze-events', '3'));
 const maxStallMs = Number(arg('--max-stall-ms', '2000'));
 const maxFreezeCount = Number(arg('--max-freeze-count', '3'));
-const minDecoded = Number(arg('--min-decoded', String(Math.max(60, durationS * 20))));
+const scoredDurationS = Math.max(1, durationS - warmupS);
+const minDecoded = Number(arg('--min-decoded', String(Math.max(60, Math.floor(scoredDurationS * 20)))));
 const relay = ['1', 'true', 'yes'].includes(env('OME_SOAK_ICE_RELAY', '0'));
 const bindHost = env('STATIC_BIND', '0.0.0.0');
 const publicHost = env('STATIC_HOST', host);
@@ -127,7 +129,7 @@ async function main() {
   console.log(`cdp=${cdpUrl}`);
   console.log(`static=http://${publicHost}:${staticPort}/webrtc_stutter.html`);
   console.log(
-    `ws=${wsBase} duration=${durationS}s exactly ${clients.length} tabs: ${clients
+    `ws=${wsBase} duration=${durationS}s warmup=${warmupS}s exactly ${clients.length} tabs: ${clients
       .map((c) => c.label + '>' + c.rendition)
       .join(',')}`,
   );
@@ -147,6 +149,7 @@ async function main() {
       `?ws=${encodeURIComponent(wsBase)}` +
       `&rendition=${encodeURIComponent(c.rendition)}` +
       `&label=${encodeURIComponent(c.label)}` +
+      `&warmup=${encodeURIComponent(String(warmupS))}` +
       (relay ? '&relay=1' : '');
     console.log(`open [${c.label}] ${c.rendition}`);
     await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });

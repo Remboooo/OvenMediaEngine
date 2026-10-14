@@ -11,6 +11,8 @@ const params = new URLSearchParams(location.search);
 const wsUrl = params.get('ws');
 const rendition = params.get('rendition') || '';
 const label = params.get('label') || rendition || 'default';
+// Ignore connect/keyframe ramp when scoring freezes (default 3s).
+const warmupS = Math.max(0, Number(params.get('warmup') || '3'));
 
 window.__STUTTER__ = {
   label,
@@ -36,6 +38,14 @@ let stallMs = 0;
 let maxGapMs = 0;
 let framesDecodedTotal = 0;
 let startedAt = null;
+let warmedUp = false;
+let baselineFreezeCount = 0;
+let baselineTotalFreezesDuration = 0;
+let baselineDecoded = 0;
+let baselineReceived = 0;
+let baselineBytes = 0;
+let baselinePacketsLost = 0;
+let baselineAt = null;
 
 ws.onopen = () => ws.send(JSON.stringify({ command: 'request_offer' }));
 ws.onerror = () => { out.error = 'websocket error'; };
@@ -117,10 +127,32 @@ setInterval(async () => {
   const totalFreezesDuration = inbound.totalFreezesDuration ?? 0;
   const framesDropped = inbound.framesDropped ?? 0;
   const packetsLost = inbound.packetsLost ?? 0;
+  const framesReceived = inbound.framesReceived ?? 0;
+  const bytesReceived = inbound.bytesReceived ?? 0;
+  const playingS = startedAt == null ? 0 : (now - startedAt) / 1000;
+  const frameWidth = inbound.frameWidth ?? 0;
+  const frameHeight = inbound.frameHeight ?? 0;
+
+  // After ICE+first keyframe, reset freeze accounting so startup ramp does not FAIL.
+  if (!warmedUp && startedAt != null && playingS >= warmupS && decoded > 0 && frameWidth > 0) {
+    warmedUp = true;
+    baselineAt = now;
+    baselineFreezeCount = freezeCount;
+    baselineTotalFreezesDuration = totalFreezesDuration;
+    baselineDecoded = decoded;
+    baselineReceived = framesReceived;
+    baselineBytes = bytesReceived;
+    baselinePacketsLost = packetsLost;
+    freezeEvents = 0;
+    stallMs = 0;
+    maxGapMs = 0;
+    lastDecoded = decoded;
+    lastSampleAt = now;
+  }
 
   let gapMs = 0;
   let deltaDecoded = 0;
-  if (lastDecoded != null && lastSampleAt != null) {
+  if (warmedUp && lastDecoded != null && lastSampleAt != null) {
     deltaDecoded = decoded - lastDecoded;
     gapMs = now - lastSampleAt;
     if (deltaDecoded <= 0 && gapMs >= 200) {
@@ -132,8 +164,10 @@ setInterval(async () => {
   lastDecoded = decoded;
   lastSampleAt = now;
 
+  const scoredS = baselineAt == null ? 0 : (now - baselineAt) / 1000;
   const sample = {
-    t: startedAt == null ? 0 : (now - startedAt) / 1000,
+    t: playingS,
+    scoredS,
     decoded,
     deltaDecoded,
     gapMs: Math.round(gapMs),
@@ -143,15 +177,12 @@ setInterval(async () => {
     packetsLost,
     nackCount: inbound.nackCount ?? 0,
     pliCount: inbound.pliCount ?? 0,
-    bytesReceived: inbound.bytesReceived ?? 0,
-    frameWidth: inbound.frameWidth ?? 0,
-    frameHeight: inbound.frameHeight ?? 0,
+    bytesReceived,
+    frameWidth,
+    frameHeight,
   };
   out.samples.push(sample);
   if (out.samples.length > 600) out.samples.shift();
-
-  const framesReceived = inbound.framesReceived ?? 0;
-  const bytesReceived = inbound.bytesReceived ?? 0;
   let localCandidateType = null;
   let remoteCandidateType = null;
   let localProtocol = null;
@@ -182,23 +213,29 @@ setInterval(async () => {
       }
     }
   }
+  const scoredDecoded = Math.max(0, framesDecodedTotal - baselineDecoded);
+  const scoredReceived = Math.max(0, framesReceived - baselineReceived);
+  const scoredBytes = Math.max(0, bytesReceived - baselineBytes);
   out.summary = {
     label,
     state: out.state,
     ice: out.ice,
     rendition,
-    playingS: startedAt == null ? 0 : (now - startedAt) / 1000,
-    framesDecoded: framesDecodedTotal,
-    framesReceived,
-    decodeRatio: framesReceived ? framesDecodedTotal / framesReceived : 0,
-    bitrateMbps: sample.t > 1 ? (bytesReceived * 8) / sample.t / 1e6 : 0,
+    playingS,
+    warmupS,
+    warmedUp,
+    scoredS,
+    framesDecoded: scoredDecoded,
+    framesReceived: scoredReceived,
+    decodeRatio: scoredReceived ? scoredDecoded / scoredReceived : 0,
+    bitrateMbps: scoredS > 1 ? (scoredBytes * 8) / scoredS / 1e6 : 0,
     freezeEvents,
     stallMs: Math.round(stallMs),
     maxGapMs: Math.round(maxGapMs),
-    freezeCount,
-    totalFreezesDuration,
+    freezeCount: Math.max(0, freezeCount - baselineFreezeCount),
+    totalFreezesDuration: Math.max(0, totalFreezesDuration - baselineTotalFreezesDuration),
     framesDropped,
-    packetsLost,
+    packetsLost: Math.max(0, packetsLost - baselinePacketsLost),
     frameWidth: sample.frameWidth,
     frameHeight: sample.frameHeight,
     localCandidateType,
