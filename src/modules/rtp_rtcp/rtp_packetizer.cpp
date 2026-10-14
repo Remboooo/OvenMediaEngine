@@ -110,9 +110,10 @@ void RtpPacketizer::SetCsrcs(const std::vector<uint32_t> &csrcs)
 	_csrcs = csrcs;
 }
 
-void RtpPacketizer::SetUlpfec(uint8_t red_payload_type, uint8_t ulpfec_payload_type)
+void RtpPacketizer::SetUlpfec(uint8_t red_payload_type, uint8_t ulpfec_payload_type, bool generate_fec)
 {
 	_ulpfec_enabled = true;
+	_ulpfec_generate_fec = generate_fec;
 	_red_payload_type = red_payload_type;
 	_ulpfec_payload_type = ulpfec_payload_type;
 }
@@ -246,13 +247,16 @@ bool RtpPacketizer::GenerateRedAndFecPackets(const std::shared_ptr<RtpPacket> &p
 	// Because FEC packet should not affect the sequence number of the RTP packet.
 	AssignSequenceNumber(red_packet.get(), true);
 
-	_ulpfec_generator.AddMediaPacket(packet, red_packet->SequenceNumber());
+	if (_ulpfec_generate_fec)
+	{
+		_ulpfec_generator.AddMediaPacket(packet, red_packet->SequenceNumber());
+	}
 
 	// Adjust completed red packet's payload offset and size for RTX packet
 	red_packet->PackageAsRtp();
 	_stream->OnRtpPacketized(red_packet);
 
-	if (_ulpfec_generator.IsAvailableFecPackets() == false)
+	if (_ulpfec_generate_fec == false || _ulpfec_generator.IsAvailableFecPackets() == false)
 	{
 		return true;
 	}

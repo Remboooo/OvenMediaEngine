@@ -3,6 +3,8 @@
 #include "publisher_private.h"
 #include <base/event/command/commands.h>
 
+#include <limits>
+
 namespace pub
 {
 	StreamWorker::StreamWorker(const std::shared_ptr<Stream> &parent_stream)
@@ -147,9 +149,27 @@ namespace pub
 		return it->second;
 	}
 
+	bool StreamWorker::HasSessions()
+	{
+		std::shared_lock<std::shared_mutex> lock(_session_map_mutex);
+		return _sessions.empty() == false;
+	}
+
+	size_t StreamWorker::GetSessionCount()
+	{
+		std::shared_lock<std::shared_mutex> lock(_session_map_mutex);
+		return _sessions.size();
+	}
+
 	void StreamWorker::SendPacket(const std::any &packet)
 	{
-		_packet_queue.Enqueue(packet);
+		_packet_queue.Enqueue(WorkerPacket{packet, 0});
+		_queue_event.Notify();
+	}
+
+	void StreamWorker::SendPacketToSession(session_id_t session_id, const std::any &packet)
+	{
+		_packet_queue.Enqueue(WorkerPacket{packet, session_id});
 		_queue_event.Notify();
 	}
 
@@ -160,7 +180,7 @@ namespace pub
 		_queue_event.Notify();
 	}
 
-	std::optional<std::any> StreamWorker::PopStreamPacket()
+	std::optional<StreamWorker::WorkerPacket> StreamWorker::PopStreamPacket()
 	{
 		if (_packet_queue.IsEmpty())
 		{
@@ -204,12 +224,22 @@ namespace pub
 
 			auto packet = PopStreamPacket();
 			if (packet.has_value())
-			{		
+			{
 				session_lock.lock();
-				for (auto const &x : _sessions)
+				if (packet->session_id != 0)
 				{
-					auto session = x.second;
-					session->SendOutgoingData(packet.value());
+					auto it = _sessions.find(packet->session_id);
+					if (it != _sessions.end())
+					{
+						it->second->SendOutgoingData(packet->packet);
+					}
+				}
+				else
+				{
+					for (auto const &x : _sessions)
+					{
+						x.second->SendOutgoingData(packet->packet);
+					}
 				}
 				session_lock.unlock();
 			}
@@ -549,19 +579,61 @@ namespace pub
 
 	std::shared_ptr<StreamWorker> Stream::GetWorkerBySessionID(session_id_t session_id)
 	{
-		if(_worker_count == 0)
+		if (_worker_count == 0)
 		{
 			return nullptr;
 		}
 
-		size_t worker_id = session_id % _worker_count;
-		if(worker_id >= _stream_workers.size())
+		uint32_t worker_id;
 		{
-			logtw("Invalid worker id : %zu", worker_id);
+			std::lock_guard<std::mutex> index_lock(_session_worker_index_mutex);
+			auto it = _session_worker_index.find(session_id);
+			if (it == _session_worker_index.end())
+			{
+				return nullptr;
+			}
+			worker_id = it->second;
+		}
+
+		if (worker_id >= _stream_workers.size())
+		{
+			logtw("Invalid worker id : %u", worker_id);
 			return nullptr;
 		}
 
 		return _stream_workers[worker_id];
+	}
+
+	uint32_t Stream::AssignWorkerIndexForSession(session_id_t session_id)
+	{
+		std::lock_guard<std::mutex> index_lock(_session_worker_index_mutex);
+
+		auto existing = _session_worker_index.find(session_id);
+		if (existing != _session_worker_index.end())
+		{
+			return existing->second;
+		}
+
+		uint32_t best_index = 0;
+		size_t best_count	= std::numeric_limits<size_t>::max();
+		for (uint32_t i = 0; i < _stream_workers.size(); i++)
+		{
+			const auto count = _stream_workers[i]->GetSessionCount();
+			if (count < best_count)
+			{
+				best_count = count;
+				best_index = i;
+			}
+		}
+
+		_session_worker_index[session_id] = best_index;
+		return best_index;
+	}
+
+	void Stream::ReleaseWorkerIndexForSession(session_id_t session_id)
+	{
+		std::lock_guard<std::mutex> index_lock(_session_worker_index_mutex);
+		_session_worker_index.erase(session_id);
 	}
 
 	bool Stream::AddSession(std::shared_ptr<Session> session)
@@ -582,12 +654,17 @@ namespace pub
 		// The worker is found first, so a session that is refused is never left in `_sessions`
 		if (_worker_count > 0)
 		{
+			const auto worker_index = AssignWorkerIndexForSession(session->GetId());
 			worker = GetWorkerBySessionID(session->GetId());
 			if (worker == nullptr)
 			{
 				logte("Cannot find worker for session : %u", session->GetId());
+				ReleaseWorkerIndexForSession(session->GetId());
 				return false;
 			}
+
+			logtd("Session (%u) assigned to stream worker %u (%zu sessions on worker)",
+				  session->GetId(), worker_index, worker->GetSessionCount());
 		}
 
 		if (_sessions.count(session->GetId()) > 0)
@@ -623,6 +700,7 @@ namespace pub
 			}
 
 			worker = GetWorkerBySessionID(id);
+			ReleaseWorkerIndexForSession(id);
 		}
 
 		if (worker == nullptr)
@@ -664,6 +742,12 @@ namespace pub
 			std::shared_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
 			for (uint32_t i = 0; i < _stream_workers.size(); i++)
 			{
+				// Skip idle workers — every RTP was previously copied into all
+				// StreamWorker queues even when only one shard had sessions.
+				if (_stream_workers[i]->HasSessions() == false)
+				{
+					continue;
+				}
 				_stream_workers[i]->SendPacket(packet);
 			}
 		}
@@ -677,6 +761,43 @@ namespace pub
 			}
 		}
 	
+		return true;
+	}
+
+	bool Stream::DeliverPacketToSessions(const std::any &packet, const std::vector<session_id_t> &session_ids)
+	{
+		if (session_ids.empty())
+		{
+			return true;
+		}
+
+		if (_worker_count > 0)
+		{
+			std::shared_lock<std::shared_mutex> worker_lock(_stream_worker_lock);
+			for (const auto session_id : session_ids)
+			{
+				auto worker = GetWorkerBySessionID(session_id);
+				if (worker == nullptr)
+				{
+					continue;
+				}
+				worker->SendPacketToSession(session_id, packet);
+			}
+		}
+		else
+		{
+			std::shared_lock<std::shared_mutex> session_lock(_session_map_mutex);
+			for (const auto session_id : session_ids)
+			{
+				auto it = _sessions.find(session_id);
+				if (it == _sessions.end())
+				{
+					continue;
+				}
+				it->second->SendOutgoingData(packet);
+			}
+		}
+
 		return true;
 	}
 

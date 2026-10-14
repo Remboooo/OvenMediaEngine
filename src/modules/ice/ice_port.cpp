@@ -204,7 +204,32 @@ bool IcePort::CreateTurnServer(const ov::SocketAddress &address, ov::SocketType 
 
 std::shared_ptr<PhysicalPort> IcePort::CreatePhysicalPort(const ov::SocketAddress &address, ov::SocketType type, int worker_count)
 {
-	auto physical_port = PhysicalPortManager::GetInstance()->CreatePort("ICE", type, address, worker_count);
+	// 4K WebRTC + ULPFEC keyframes (and several sessions sharing one ICE UDP
+	// fd) need multi-MB SNDBUF. Stock Linux wmem_default (~208 KiB) overflows;
+	// MSG_DONTWAIT then EAGAIN-stalls the per-session send thread → freezes
+	// with packetsLost=0. Deploy raises net.core.wmem_max. Target ~16 MiB
+	// after kernel doubling. Applied via OnSocketCreated for REUSEPORT.
+	constexpr int kIceUdpSendBufferBytes = 16 * 1024 * 1024;
+	constexpr int kIceUdpRecvBufferBytes = 16 * 1024 * 1024;
+
+	PhysicalPort::OnSocketCreated on_created = nullptr;
+	if (type == ov::SocketType::Udp)
+	{
+		on_created = [](const std::shared_ptr<ov::Socket> &socket) -> std::shared_ptr<ov::Error> {
+			// Kernel doubles the requested value; request half of target.
+			socket->SetSockOpt<int>(SO_SNDBUF, kIceUdpSendBufferBytes / 2);
+			socket->SetSockOpt<int>(SO_RCVBUF, kIceUdpRecvBufferBytes / 2);
+			int snd = 0;
+			int rcv = 0;
+			socket->GetSockOpt(SO_SNDBUF, &snd);
+			socket->GetSockOpt(SO_RCVBUF, &rcv);
+			logti("ICE UDP socket fd=%d SO_SNDBUF=%d SO_RCVBUF=%d", socket->GetNativeHandle(), snd, rcv);
+			return nullptr;
+		};
+	}
+
+	auto physical_port = PhysicalPortManager::GetInstance()->CreatePort(
+		"ICE", type, address, worker_count, false, 0, 0, on_created);
 	if (physical_port != nullptr)
 	{
 		if (physical_port->AddObserver(this))

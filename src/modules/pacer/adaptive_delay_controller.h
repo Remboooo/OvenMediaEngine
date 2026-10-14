@@ -10,12 +10,14 @@
 #include <chrono>
 #include <deque>
 
-// Stream-scoped adaptive smoothing-delay controller.
+// Pace-group adaptive smoothing-delay controller.
 //
-// Each FramePacer records its observed lateness (arrival vs. DTS-anchored
-// expected time) into this shared controller. The controller maintains a
-// rolling window of samples across all tracks and exposes a single current
-// delay so that all tracks of a stream stay in lock-step (preserves A/V sync).
+// Each FramePacer in a pace group records its observed lateness (arrival vs.
+// DTS-anchored expected time) into this controller. The controller maintains a
+// rolling window of samples across tracks in the group and exposes a single
+// current delay so those tracks stay in lock-step (preserves A/V sync within
+// the group). Separate video rungs use separate controllers so a late ladder
+// track cannot inflate bypass hold time.
 //
 // The current delay tracks a target percentile of recent lateness plus a small
 // margin: the Pacer absorbs everything up to that percentile, and the
