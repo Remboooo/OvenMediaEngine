@@ -54,6 +54,7 @@ void AdaptiveDelayController::RecordSample(uint32_t track_id, int64_t lateness_m
 	bool warn_exceed_max	 = false;
 	int64_t warn_late_value	 = 0;
 	int warn_late_max		 = 0;
+	uint32_t warn_late_track = 0;
 
 	bool warn_max_reached	 = false;
 	int warn_max_value		 = 0;
@@ -78,6 +79,7 @@ void AdaptiveDelayController::RecordSample(uint32_t track_id, int64_t lateness_m
 				warn_exceed_max		= true;
 				warn_late_value		= lateness_ms;
 				warn_late_max		= _max_delay_ms;
+				warn_late_track		= track_id;
 			}
 		}
 
@@ -117,10 +119,11 @@ void AdaptiveDelayController::RecordSample(uint32_t track_id, int64_t lateness_m
 
 	if (warn_exceed_max)
 	{
-		logtw("[%s] Lateness %lldms exceeds configured Pacer Max %dms — Pacer cannot smooth this frame; receiver likely drops it. Consider raising Max or investigating source jitter.",
+		logtw("[%s] Lateness %lldms exceeds configured Pacer Max %dms on track %u — Pacer cannot smooth this frame; receiver likely drops it. Consider raising Max or investigating source jitter.",
 			  _stream_id.CStr(),
 			  static_cast<long long>(warn_late_value),
-			  warn_late_max);
+			  warn_late_max,
+			  warn_late_track);
 	}
 	if (warn_max_reached)
 	{

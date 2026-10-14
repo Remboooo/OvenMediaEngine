@@ -1,0 +1,215 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC stutter probe</title>
+</head>
+<body>
+<video id="v" autoplay muted playsinline></video>
+<script type="module">
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get('ws');
+const rendition = params.get('rendition') || '';
+const label = params.get('label') || rendition || 'default';
+
+window.__STUTTER__ = {
+  label,
+  state: 'connecting',
+  ice: null,
+  error: null,
+  renditionSent: false,
+  samples: [],
+  summary: null,
+};
+
+const out = window.__STUTTER__;
+const video = document.getElementById('v');
+
+const ws = new WebSocket(wsUrl);
+let pc = null;
+let sessionId = null;
+let peerId = null;
+let lastDecoded = null;
+let lastSampleAt = null;
+let freezeEvents = 0;
+let stallMs = 0;
+let maxGapMs = 0;
+let framesDecodedTotal = 0;
+let startedAt = null;
+
+ws.onopen = () => ws.send(JSON.stringify({ command: 'request_offer' }));
+ws.onerror = () => { out.error = 'websocket error'; };
+ws.onclose = () => { if (out.state !== 'playing' && out.state !== 'done') out.error ??= 'websocket closed'; };
+
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.error) {
+    out.error = `signalling ${msg.code}: ${msg.error}`;
+    return;
+  }
+  if (msg.command !== 'offer') return;
+  try {
+    sessionId = msg.id;
+    peerId = msg.peer_id;
+    const config = {};
+    if (params.get('relay') === '1') {
+      config.iceServers = msg.iceServers ?? [];
+      config.iceTransportPolicy = 'relay';
+    }
+    pc = new RTCPeerConnection(config);
+    pc.ontrack = (e) => {
+      if (e.track.kind === 'video') {
+        video.srcObject = e.streams[0] ?? new MediaStream([e.track]);
+      }
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        ws.send(JSON.stringify({
+          command: 'candidate',
+          id: sessionId,
+          peer_id: peerId,
+          candidates: [e.candidate],
+        }));
+      }
+    };
+    pc.oniceconnectionstatechange = () => { out.ice = pc.iceConnectionState; };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        out.state = 'playing';
+        startedAt = performance.now();
+        if (rendition && !out.renditionSent) {
+          out.renditionSent = true;
+          ws.send(JSON.stringify({
+            command: 'change_rendition',
+            id: sessionId,
+            peer_id: peerId,
+            rendition_name: rendition,
+            auto: false,
+          }));
+        }
+      }
+      if (pc.connectionState === 'failed') out.error = 'peer connection failed';
+    };
+
+    await pc.setRemoteDescription(msg.sdp);
+    for (const c of msg.candidates ?? []) await pc.addIceCandidate(c);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ command: 'answer', id: sessionId, peer_id: peerId, sdp: answer }));
+  } catch (e) {
+    out.error = String(e);
+  }
+};
+
+setInterval(async () => {
+  if (!pc || out.state === 'connecting') return;
+  const now = performance.now();
+  const stats = await pc.getStats();
+  let inbound = null;
+  stats.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') inbound = s;
+  });
+  if (!inbound) return;
+
+  const decoded = inbound.framesDecoded ?? 0;
+  framesDecodedTotal = decoded;
+  const freezeCount = inbound.freezeCount ?? 0;
+  const totalFreezesDuration = inbound.totalFreezesDuration ?? 0;
+  const framesDropped = inbound.framesDropped ?? 0;
+  const packetsLost = inbound.packetsLost ?? 0;
+
+  let gapMs = 0;
+  let deltaDecoded = 0;
+  if (lastDecoded != null && lastSampleAt != null) {
+    deltaDecoded = decoded - lastDecoded;
+    gapMs = now - lastSampleAt;
+    if (deltaDecoded <= 0 && gapMs >= 200) {
+      freezeEvents += 1;
+      stallMs += gapMs;
+      if (gapMs > maxGapMs) maxGapMs = gapMs;
+    }
+  }
+  lastDecoded = decoded;
+  lastSampleAt = now;
+
+  const sample = {
+    t: startedAt == null ? 0 : (now - startedAt) / 1000,
+    decoded,
+    deltaDecoded,
+    gapMs: Math.round(gapMs),
+    freezeCount,
+    totalFreezesDuration,
+    framesDropped,
+    packetsLost,
+    nackCount: inbound.nackCount ?? 0,
+    pliCount: inbound.pliCount ?? 0,
+    bytesReceived: inbound.bytesReceived ?? 0,
+    frameWidth: inbound.frameWidth ?? 0,
+    frameHeight: inbound.frameHeight ?? 0,
+  };
+  out.samples.push(sample);
+  if (out.samples.length > 600) out.samples.shift();
+
+  const framesReceived = inbound.framesReceived ?? 0;
+  const bytesReceived = inbound.bytesReceived ?? 0;
+  let localCandidateType = null;
+  let remoteCandidateType = null;
+  let localProtocol = null;
+  let remoteProtocol = null;
+  let networkType = null;
+  let availableOutgoingBitrate = null;
+  let currentRoundTripTime = null;
+  if (inbound.transportId) {
+    const transport = stats.get(inbound.transportId);
+    if (transport) {
+      const selected = transport.selectedCandidatePairId
+        ? stats.get(transport.selectedCandidatePairId)
+        : null;
+      if (selected) {
+        currentRoundTripTime = selected.currentRoundTripTime ?? null;
+        availableOutgoingBitrate = selected.availableOutgoingBitrate ?? null;
+        const local = selected.localCandidateId ? stats.get(selected.localCandidateId) : null;
+        const remote = selected.remoteCandidateId ? stats.get(selected.remoteCandidateId) : null;
+        if (local) {
+          localCandidateType = local.candidateType ?? null;
+          localProtocol = local.protocol ?? null;
+          networkType = local.networkType ?? null;
+        }
+        if (remote) {
+          remoteCandidateType = remote.candidateType ?? null;
+          remoteProtocol = remote.protocol ?? null;
+        }
+      }
+    }
+  }
+  out.summary = {
+    label,
+    state: out.state,
+    ice: out.ice,
+    rendition,
+    playingS: startedAt == null ? 0 : (now - startedAt) / 1000,
+    framesDecoded: framesDecodedTotal,
+    framesReceived,
+    decodeRatio: framesReceived ? framesDecodedTotal / framesReceived : 0,
+    bitrateMbps: sample.t > 1 ? (bytesReceived * 8) / sample.t / 1e6 : 0,
+    freezeEvents,
+    stallMs: Math.round(stallMs),
+    maxGapMs: Math.round(maxGapMs),
+    freezeCount,
+    totalFreezesDuration,
+    framesDropped,
+    packetsLost,
+    frameWidth: sample.frameWidth,
+    frameHeight: sample.frameHeight,
+    localCandidateType,
+    remoteCandidateType,
+    localProtocol,
+    remoteProtocol,
+    networkType,
+    currentRoundTripTime,
+    availableOutgoingBitrate,
+  };
+}, 250);
+</script>
+</body>
+</html>

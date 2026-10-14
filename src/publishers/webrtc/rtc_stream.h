@@ -15,9 +15,13 @@
 #include <modules/ice/ice_port.h>
 #include <modules/pacer/adaptive_delay_controller.h>
 #include <modules/pacer/frame_pacer.h>
+#include <modules/pacer/pace_group_map.h>
 #include <modules/rtp_rtcp/rtp_history.h>
 #include <modules/rtp_rtcp/rtp_rtcp_defines.h>
 #include <modules/sdp/session_description.h>
+
+#include <unordered_map>
+#include <unordered_set>
 
 #include "rtc_playlist.h"
 #include "rtc_session.h"
@@ -52,10 +56,24 @@ public:
 
 	std::shared_ptr<RtxRtpPacket> GetRtxRtpPacket(uint32_t track_id, uint8_t origin_payload_type, uint16_t origin_sequence_number);
 
+	// Demand-based packetize/pace: only tracks selected by ≥1 session enter
+	// the pacer / packetizer. Current-rendition tracks are fully packetized;
+	// pending-next tracks are keyframe-only until the ABR cut (sessions drop
+	// non-keyframes of next via IsSelectedPacket anyway).
+	void SetSessionDemandedTracks(const std::shared_ptr<RtcSession> &session,
+								  std::unordered_set<uint32_t> current_track_ids,
+								  std::unordered_set<uint32_t> next_track_ids,
+								  bool red_enabled);
+	void ClearSessionDemandedTracks(session_id_t session_id);
+	bool IsTrackDemanded(uint32_t track_id) const;
+	bool IsTrackFullyDemanded(uint32_t track_id) const;
+
 	// RtpRtcpPacketizerInterface Implementation
 	bool OnRtpPacketized(std::shared_ptr<RtpPacket> packet) override;
 
 private:
+	void RebuildDemandedTracksUnlocked();
+	void LogDemandedTracksUnlocked() const;
 	bool Start() override;
 	bool Stop() override;
 	// TODO(Getroot): a running session cannot adopt a codec change today; renegotiating the SDP on a codec change would allow it
@@ -121,21 +139,46 @@ private:
 	int _playout_delay_min		= 0;
 	int _playout_delay_max		= 0;
 
+	// Always true once pace groups are created: packetize runs on per-rung
+	// DelayQueue threads. <JitterBuffer> only enables AdaptiveDelay hold.
 	bool _pacer_enabled = false;
+	bool _jitter_buffer_enabled = false;
 
 	bool _transport_cc_enabled = false;
 	bool _remb_enabled		   = false;
 
 	uint32_t _worker_count = 0;
 
-	// Per-stream scheduler shared by all FramePacers (one worker thread).
-	std::shared_ptr<ov::DelayQueue> _pacer_scheduler;
+	// Per-pace-group resources (one DelayQueue thread + AdaptiveDelay per video
+	// rung; audio joins a video group only when uniquely paired — see
+	// BuildPaceGroupMap). Prevents a late ladder track from blocking bypass
+	// packetize or inflating bypass hold time.
+	struct PaceGroup
+	{
+		std::shared_ptr<ov::DelayQueue> scheduler;
+		std::shared_ptr<AdaptiveDelayController> adaptive;
+	};
+	std::map<uint32_t, std::shared_ptr<PaceGroup>> _pace_groups;
 	std::map<uint32_t, std::shared_ptr<FramePacer>> _pacers;
 	std::shared_mutex _pacers_lock;
 
-	// Stream-shared adaptive delay controller used by the frame pacers.
-	std::shared_ptr<AdaptiveDelayController> _adaptive_delay_controller;
 	ov::Queue<std::shared_ptr<MediaPacket>> _initial_media_packet_buffer;
+
+	struct SessionTrackDemand
+	{
+		std::weak_ptr<RtcSession> session;
+		std::unordered_set<uint32_t> current_track_ids;
+		std::unordered_set<uint32_t> next_track_ids;
+		bool red_enabled = false;
+	};
+	std::unordered_map<session_id_t, SessionTrackDemand> _session_demanded_tracks;
+	// Union of every session's current-rendition tracks (full packetize).
+	std::unordered_set<uint32_t> _fully_demanded_tracks;
+	// Union of current + next (anything that may be packetized at all).
+	std::unordered_set<uint32_t> _demanded_tracks;
+	// track_id → sessions that currently or pending-next need that track
+	std::unordered_map<uint32_t, std::unordered_set<session_id_t>> _track_interested_sessions;
+	mutable std::shared_mutex _demand_lock;
 
 	ov::String _default_playlist_name;
 

@@ -8,6 +8,9 @@
 //==============================================================================
 #include "rtc_session.h"
 
+#include <chrono>
+#include <cinttypes>
+#include <thread>
 #include <utility>
 
 #include "base/info/stream.h"
@@ -194,6 +197,8 @@ bool RtcSession::Start()
 	auto current_video_track = _current_rendition->GetVideoTrack();
 	auto current_audio_track = _current_rendition->GetAudioTrack();
 
+	PublishTrackDemand();
+
 	SendPlaylistInfo(_playlist);
 	SendRenditionChanged(_current_rendition);
 
@@ -219,11 +224,81 @@ bool RtcSession::Start()
 	RegisterNextNode(nullptr);
 	ov::Node::Start();
 
-	return Session::Start();
+	if (Session::Start() == false)
+	{
+		return false;
+	}
+
+	StartSendThread();
+	return true;
+}
+
+void RtcSession::StartSendThread()
+{
+	if (_send_running.exchange(true) == true)
+	{
+		return;
+	}
+
+	_send_queue.SetAlias(ov::String::FormatString("RtcSend-%u", GetId()).CStr());
+	_send_thread = std::thread(&RtcSession::SendThreadProc, this);
+}
+
+void RtcSession::StopSendThread()
+{
+	if (_send_running.exchange(false) == false)
+	{
+		return;
+	}
+
+	_send_queue.Stop();
+	if (_send_thread.joinable())
+	{
+		_send_thread.join();
+	}
+}
+
+void RtcSession::SendThreadProc()
+{
+	ov::logger::ThreadHelper thread_helper;
+
+	// Drain as fast as the kernel accepts. App-level bitrate caps were tried and
+	// caused silent freezes (RTP seq is assigned here, so queue delay ≠ packetsLost).
+	// Kernel SO_SNDBUF + sendmsg EAGAIN retry absorb keyframe microbursts.
+	auto last_log = std::chrono::steady_clock::now();
+
+	while (true)
+	{
+		auto packet = _send_queue.Dequeue();
+		if (packet.has_value() == false)
+		{
+			break;
+		}
+
+		ProcessOutgoingRtp(packet.value());
+		_send_processed.fetch_add(1, std::memory_order_relaxed);
+
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last_log > std::chrono::seconds(5))
+		{
+			last_log = now;
+			const uint64_t drops = _send_queue_drops.load(std::memory_order_relaxed);
+			const uint64_t enq = _send_enqueued.load(std::memory_order_relaxed);
+			const uint64_t proc = _send_processed.load(std::memory_order_relaxed);
+			if (drops > 0 || _send_queue.Size() > 256)
+			{
+				logtw("RtcSend session=%u queue=%zu drops=%" PRIu64 " enq=%" PRIu64 " proc=%" PRIu64,
+					  GetId(), _send_queue.Size(), drops, enq, proc);
+			}
+		}
+	}
 }
 
 bool RtcSession::Stop()
 {
+	// Drain/join send thread before taking _start_stop_lock (send path uses a shared lock).
+	StopSendThread();
+
 	// start and stop must be called independently.
 	std::lock_guard<std::shared_mutex> lock(_start_stop_lock);
 
@@ -232,6 +307,12 @@ bool RtcSession::Stop()
 	if (pub::Session::GetState() != SessionState::Started && pub::Session::GetState() != SessionState::Stopping)
 	{
 		return true;
+	}
+
+	auto rtc_stream = std::static_pointer_cast<RtcStream>(GetStream());
+	if (rtc_stream != nullptr)
+	{
+		rtc_stream->ClearSessionDemandedTracks(GetId());
 	}
 
 	if (_bandwidth_estimator != nullptr)
@@ -490,6 +571,7 @@ void RtcSession::ChangeRendition()
 
 	lock.unlock();
 
+	PublishTrackDemand();
 	SendRenditionChanged(_current_rendition);
 }
 
@@ -500,8 +582,45 @@ bool RtcSession::IsNextRenditionAvailable() const
 
 void RtcSession::SetNextRendition(const std::shared_ptr<const RtcRendition> &rendition)
 {
-	std::unique_lock<std::shared_mutex> lock(_change_rendition_lock);
-	_next_rendition = rendition;
+	{
+		std::unique_lock<std::shared_mutex> lock(_change_rendition_lock);
+		_next_rendition = rendition;
+	}
+	// Demand the target rung immediately so it is packetized before the
+	// keyframe switch (ChangeRendition) completes.
+	PublishTrackDemand();
+}
+
+void RtcSession::PublishTrackDemand()
+{
+	auto rtc_stream = std::static_pointer_cast<RtcStream>(GetStream());
+	if (rtc_stream == nullptr)
+	{
+		return;
+	}
+
+	std::unordered_set<uint32_t> current_track_ids;
+	std::unordered_set<uint32_t> next_track_ids;
+	auto add_rendition_tracks = [](const std::shared_ptr<const RtcRendition> &rendition,
+								   std::unordered_set<uint32_t> &track_ids) {
+		if (rendition == nullptr)
+		{
+			return;
+		}
+		if (auto video = rendition->GetVideoTrack(); video != nullptr)
+		{
+			track_ids.insert(video->GetId());
+		}
+		if (auto audio = rendition->GetAudioTrack(); audio != nullptr)
+		{
+			track_ids.insert(audio->GetId());
+		}
+	};
+
+	add_rendition_tracks(GetCurrentRendition(), current_track_ids);
+	add_rendition_tracks(GetNextRendition(), next_track_ids);
+
+	rtc_stream->SetSessionDemandedTracks(pub::Session::GetSharedPtrAs<RtcSession>(), std::move(current_track_ids), std::move(next_track_ids), _red_enabled);
 }
 
 std::shared_ptr<const RtcRendition> RtcSession::GetCurrentRendition() const
@@ -578,7 +697,44 @@ bool RtcSession::IsSelectedPacket(const std::shared_ptr<const RtpPacket> &rtp_pa
 
 void RtcSession::SendOutgoingData(const std::any &packet)
 {
-	//It must not be called during start and stop.
+	if (_send_running.load(std::memory_order_acquire) == false)
+	{
+		return;
+	}
+
+	std::shared_ptr<RtpPacket> session_packet;
+	try
+	{
+		session_packet = std::any_cast<std::shared_ptr<RtpPacket>>(packet);
+	}
+	catch (const std::bad_any_cast &e)
+	{
+		logtt("An incorrect type of packet was input from the stream.");
+		return;
+	}
+
+	if (session_packet == nullptr)
+	{
+		return;
+	}
+
+	// Soft bound only: sequence numbers are assigned at send time, so dropping
+	// here is invisible as packetsLost and manifests as freezes. Prefer growth
+	// + EAGAIN backpressure; drop only under extreme backlog (~2s at 4K).
+	static constexpr size_t kHardDropQueuePackets = 24000;
+	while (_send_queue.Size() >= kHardDropQueuePackets)
+	{
+		_send_queue.Dequeue(0);
+		_send_queue_drops.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	_send_queue.Enqueue(std::move(session_packet));
+	_send_enqueued.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RtcSession::ProcessOutgoingRtp(const std::shared_ptr<RtpPacket> &session_packet)
+{
+	// It must not be called during start and stop.
 	std::shared_lock<std::shared_mutex> lock(_start_stop_lock);
 
 	if (pub::Session::GetState() != SessionState::Started)
@@ -594,19 +750,8 @@ void RtcSession::SendOutgoingData(const std::any &packet)
 		return;
 	}
 
-	std::shared_ptr<RtpPacket> session_packet;
-
-	try
+	if (session_packet == nullptr)
 	{
-		session_packet = std::any_cast<std::shared_ptr<RtpPacket>>(packet);
-		if (session_packet == nullptr)
-		{
-			return;
-		}
-	}
-	catch (const std::bad_any_cast &e)
-	{
-		logtt("An incorrect type of packet was input from the stream.");
 		return;
 	}
 
@@ -616,7 +761,8 @@ void RtcSession::SendOutgoingData(const std::any &packet)
 		return;
 	}
 
-	// RTP Session must be copied and sent because data is altered due to SRTP.
+	// RTP packet must be copied: SRTP alters the buffer, and ULPFEC/RTX may
+	// still reference the original.
 	auto copy_packet = std::make_shared<RtpPacket>(*session_packet);
 
 	auto &media_rtp_sequence_number = copy_packet->IsVideoPacket() ? _video_rtp_sequence_number : _audio_rtp_sequence_number;
@@ -624,20 +770,16 @@ void RtcSession::SendOutgoingData(const std::any &packet)
 
 	// Set transport-wide sequence number
 	bool media_transport_cc_enabled = copy_packet->IsVideoPacket() ? _video_transport_cc_enabled : _audio_transport_cc_enabled;
-	
+
 	if (media_transport_cc_enabled)
 	{
-		 SetTransportWideSequenceNumber(copy_packet, _wide_sequence_number);
+		SetTransportWideSequenceNumber(copy_packet, _wide_sequence_number);
 	}
 
 	SetAbsSendTime(copy_packet, ov::Clock::NowMSec());
 
 	// rtp_rtcp -> srtp -> dtls -> Edge Node(RtcSession)
-	// Packet loss simulation codes
-	// if (ov::Random::GenerateUInt32(1, 33) != 10)
-	{
-		_rtp_rtcp->SendRtpPacket(copy_packet);
-	}
+	_rtp_rtcp->SendRtpPacket(copy_packet);
 
 	RecordRtpSent(copy_packet, session_packet->SequenceNumber(), media_transport_cc_enabled ? _wide_sequence_number : 0);
 

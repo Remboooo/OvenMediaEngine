@@ -8,6 +8,9 @@
 //==============================================================================
 #include "rtc_stream.h"
 
+#include <cstdlib>
+#include <optional>
+
 #include <base/info/media_extradata.h>
 #include <modules/bitstream/h264/h264_decoder_configuration_record.h>
 #include <modules/bitstream/nalu/nal_stream_converter.h>
@@ -136,22 +139,24 @@ bool RtcStream::Start()
 
 	_rtx_enabled	= webrtc_config.IsRtxEnabled();
 	_ulpfec_enabled = webrtc_config.IsUlpfecEnalbed();
+	// Diagnostic override (A/B): OME_WEBRTC_DISABLE_ULPFEC=1 forces media-PT only.
+	if (const char *disable_ulpfec = std::getenv("OME_WEBRTC_DISABLE_ULPFEC");
+		disable_ulpfec != nullptr && disable_ulpfec[0] == '1')
+	{
+		logtw("RtcStream - OME_WEBRTC_DISABLE_ULPFEC=1: Ulpfec/RED disabled for diagnostics");
+		_ulpfec_enabled = false;
+	}
 
 	auto playoutDelay  = webrtc_config.GetPlayoutDelay(&_playout_delay_enabled);
 	_playout_delay_min = playoutDelay.GetMin();
 	_playout_delay_max = playoutDelay.GetMax();
 
-	_pacer_enabled = webrtc_config.IsJitterBufferEnabled();
-
-	if (_pacer_enabled)
-	{
-		_pacer_scheduler = std::make_shared<ov::DelayQueue>("FramePacer");
-		_pacer_scheduler->Start();
-
-		_adaptive_delay_controller = std::make_shared<AdaptiveDelayController>(
-			ov::String::FormatString("%s/%s", GetApplication()->GetVHostAppName().CStr(), GetName().CStr()),
-			kPacerMinMs, kPacerMaxMs);
-	}
+	// JitterBuffer = AdaptiveDelay hold. Packetize is always offloaded onto
+	// per-rung DelayQueues so a demanded 4K passthrough is not serialized
+	// with concurrent transcoded rungs on the media thread (JB=false used
+	// to Packetize inline and the passthrough froze first).
+	_jitter_buffer_enabled = webrtc_config.IsJitterBufferEnabled();
+	_pacer_enabled		   = true;
 
 	if (webrtc_config.GetBandwidthEstimationType() == RtcBWEType::TransportCc)
 	{
@@ -179,6 +184,10 @@ bool RtcStream::Start()
 
 	std::shared_ptr<const MediaTrack> _first_video_track = nullptr;
 	std::shared_ptr<const MediaTrack> _first_audio_track = nullptr;
+
+	std::vector<uint32_t> video_track_ids;
+	std::vector<uint32_t> audio_track_ids;
+	std::vector<std::shared_ptr<const MediaTrack>> paced_tracks;
 
 	// Create Packetizer
 	for (auto &[track_id, track] : GetTracks())
@@ -211,18 +220,102 @@ bool RtcStream::Start()
 			AddRtpHistory(track);
 		}
 
-		if (_pacer_enabled && _pacer_scheduler && _adaptive_delay_controller)
+		paced_tracks.push_back(track);
+		if (track->GetMediaType() == cmn::MediaType::Video)
 		{
+			video_track_ids.push_back(track->GetId());
+		}
+		else
+		{
+			audio_track_ids.push_back(track->GetId());
+		}
+	}
+
+	if (paced_tracks.empty() == false)
+	{
+		std::vector<std::pair<std::optional<uint32_t>, std::optional<uint32_t>>> rendition_pairs;
+		for (const auto &[playlist_name, playlist] : GetPlaylists())
+		{
+			if (playlist == nullptr)
+			{
+				continue;
+			}
+			for (const auto &rendition : playlist->GetRenditionList())
+			{
+				auto video_index_hint = rendition->GetVideoIndexHint();
+				if (video_index_hint < 0)
+				{
+					video_index_hint = 0;
+				}
+				auto audio_index_hint = rendition->GetAudioIndexHint();
+				if (audio_index_hint < 0)
+				{
+					audio_index_hint = 0;
+				}
+
+				auto video_track = GetTrackByVariant(rendition->GetVideoVariantName(), video_index_hint);
+				auto audio_track = GetTrackByVariant(rendition->GetAudioVariantName(), audio_index_hint);
+
+				std::optional<uint32_t> video_id;
+				std::optional<uint32_t> audio_id;
+				if (video_track != nullptr && IsSupportedCodec(video_track->GetCodecId()))
+				{
+					video_id = video_track->GetId();
+				}
+				if (audio_track != nullptr && IsSupportedCodec(audio_track->GetCodecId()))
+				{
+					audio_id = audio_track->GetId();
+				}
+				if (video_id.has_value() || audio_id.has_value())
+				{
+					rendition_pairs.emplace_back(video_id, audio_id);
+				}
+			}
+		}
+
+		auto track_to_group = BuildPaceGroupMap(video_track_ids, audio_track_ids, rendition_pairs);
+		auto stream_label	= ov::String::FormatString("%s/%s", GetApplication()->GetVHostAppName().CStr(), GetName().CStr());
+
+		std::weak_ptr<pub::Stream> stream_weak = pub::Stream::GetSharedPtrAs<pub::Stream>();
+		const uint32_t pacer_delay_ms		   = _jitter_buffer_enabled ? static_cast<uint32_t>(kPacerMinMs) : 0;
+
+		for (const auto &track : paced_tracks)
+		{
+			auto group_it = track_to_group.find(track->GetId());
+			uint32_t group_id = (group_it != track_to_group.end()) ? group_it->second : track->GetId();
+
+			std::shared_ptr<PaceGroup> group;
+			auto existing = _pace_groups.find(group_id);
+			if (existing != _pace_groups.end())
+			{
+				group = existing->second;
+			}
+			else
+			{
+				group			= std::make_shared<PaceGroup>();
+				// pthread name = "DQ" + this string; keep short (15 char total limit).
+				group->scheduler = std::make_shared<ov::DelayQueue>(ov::String::FormatString("FPg%u", group_id));
+				group->scheduler->Start();
+				if (_jitter_buffer_enabled)
+				{
+					group->adaptive = std::make_shared<AdaptiveDelayController>(
+						ov::String::FormatString("%s#g%u", stream_label.CStr(), group_id),
+						kPacerMinMs, kPacerMaxMs);
+				}
+				_pace_groups[group_id] = group;
+				logti("RtcStream(%s) - Pace group %u started (DelayQueue%s)",
+					  stream_label.CStr(), group_id,
+					  _jitter_buffer_enabled ? "+AdaptiveDelay" : ", delay=0");
+			}
+
 			auto pacer = std::make_shared<FramePacer>(
-				ov::String::FormatString("%s/%s", GetApplication()->GetVHostAppName().CStr(), GetName().CStr()),
+				ov::String::FormatString("%s#t%u", stream_label.CStr(), track->GetId()),
 				track->GetTimeBase().GetNum(),
 				track->GetTimeBase().GetDen(),
-				kPacerMinMs);
+				pacer_delay_ms);
 
-			std::weak_ptr<pub::Stream> stream_weak = pub::Stream::GetSharedPtrAs<pub::Stream>();
-			bool is_video						   = (track->GetMediaType() == cmn::MediaType::Video);
-
-			pacer->Init(_pacer_scheduler,
+			bool is_video = (track->GetMediaType() == cmn::MediaType::Video);
+			pacer->Init(group->scheduler,
 						[stream_weak, is_video](const std::shared_ptr<MediaPacket> &pkt) {
 							auto stream = stream_weak.lock();
 							if (!stream)
@@ -235,8 +328,10 @@ bool RtcStream::Start()
 							else
 								rtc_stream->PacketizeAudioFrame(pkt);
 						});
-
-			pacer->SetAdaptiveController(_adaptive_delay_controller);
+			if (group->adaptive != nullptr)
+			{
+				pacer->SetAdaptiveController(group->adaptive);
+			}
 
 			std::lock_guard<std::shared_mutex> lock(_pacers_lock);
 			_pacers[track->GetId()] = pacer;
@@ -280,12 +375,13 @@ bool RtcStream::Start()
 		}
 	}
 
-	logti("WebRTC Stream has been created : %s/%u\nRtx(%s) Ulpfec(%s) PlayoutDelay(%s min:%d max:%d) JitterBuffer(%s)",
+	logti("WebRTC Stream has been created : %s/%u\nRtx(%s) Ulpfec(%s) PlayoutDelay(%s min:%d max:%d) JitterBuffer(%s) AsyncPacketize(%s)",
 		  GetName().CStr(), GetId(),
 		  ov::Converter::ToString(_rtx_enabled).CStr(),
 		  ov::Converter::ToString(_ulpfec_enabled).CStr(),
 		  ov::Converter::ToString(_playout_delay_enabled).CStr(),
 		  _playout_delay_min, _playout_delay_max,
+		  ov::Converter::ToString(_jitter_buffer_enabled).CStr(),
 		  ov::Converter::ToString(_pacer_enabled).CStr());
 
 	return Stream::Start();
@@ -298,15 +394,18 @@ bool RtcStream::Stop()
 		return false;
 	}
 
-	if (_pacer_scheduler)
-	{
-		_pacer_scheduler->Stop();
-	}
 	{
 		std::lock_guard<std::shared_mutex> lock(_pacers_lock);
 		_pacers.clear();
 	}
-	_pacer_scheduler.reset();
+	for (auto &[_, group] : _pace_groups)
+	{
+		if (group && group->scheduler)
+		{
+			group->scheduler->Stop();
+		}
+	}
+	_pace_groups.clear();
 
 	std::lock_guard<std::shared_mutex> lock(_packetizers_lock);
 	_packetizers.clear();
@@ -728,11 +827,68 @@ std::shared_ptr<PayloadAttr> RtcStream::MakeRtxPayloadAttr(const std::shared_ptr
 bool RtcStream::OnRtpPacketized(std::shared_ptr<RtpPacket> packet)
 {
 	auto stream_packet = std::make_any<std::shared_ptr<RtpPacket>>(packet);
-	BroadcastPacket(stream_packet);
 
-	if (_rtx_enabled == true)
+	// Enqueue onto each session's dedicated send thread (RtcSession::SendOutgoingData).
+	// Avoid StreamWorker merge and avoid doing SRTP on the pace-group thread.
+	const bool is_red_payload =
+		packet->PayloadType() == static_cast<uint8_t>(FixedRtcPayloadType::RED_PAYLOAD_TYPE);
+	const bool is_video = packet->IsVideoPacket();
+
+	std::vector<std::shared_ptr<RtcSession>> target_sessions;
 	{
-		// Store for retransmission
+		std::shared_lock<std::shared_mutex> lock(_demand_lock);
+		auto it = _track_interested_sessions.find(packet->GetTrackId());
+		if (it == _track_interested_sessions.end())
+		{
+			return true;
+		}
+
+		target_sessions.reserve(it->second.size());
+		for (const auto session_id : it->second)
+		{
+			auto demand_it = _session_demanded_tracks.find(session_id);
+			if (demand_it == _session_demanded_tracks.end())
+			{
+				continue;
+			}
+
+			bool accept = false;
+			if (is_video)
+			{
+				if (is_red_payload)
+				{
+					accept = demand_it->second.red_enabled;
+				}
+				else
+				{
+					accept = (demand_it->second.red_enabled == false);
+				}
+			}
+			else
+			{
+				accept = true;
+			}
+
+			if (accept == false)
+			{
+				continue;
+			}
+
+			auto session = demand_it->second.session.lock();
+			if (session != nullptr)
+			{
+				target_sessions.push_back(std::move(session));
+			}
+		}
+	}
+
+	for (const auto &session : target_sessions)
+	{
+		session->SendOutgoingData(stream_packet);
+	}
+
+	if (target_sessions.empty() == false && _rtx_enabled == true)
+	{
 		auto history = GetHistory(packet->GetTrackId(), packet->PayloadType());
 		if (history != nullptr)
 		{
@@ -741,6 +897,103 @@ bool RtcStream::OnRtpPacketized(std::shared_ptr<RtpPacket> packet)
 	}
 
 	return true;
+}
+
+void RtcStream::SetSessionDemandedTracks(const std::shared_ptr<RtcSession> &session,
+										 std::unordered_set<uint32_t> current_track_ids,
+										 std::unordered_set<uint32_t> next_track_ids,
+										 bool red_enabled)
+{
+	if (session == nullptr)
+	{
+		return;
+	}
+
+	std::unique_lock<std::shared_mutex> lock(_demand_lock);
+	auto &demand = _session_demanded_tracks[session->GetId()];
+	demand.session = session;
+	demand.current_track_ids = std::move(current_track_ids);
+	demand.next_track_ids = std::move(next_track_ids);
+	demand.red_enabled = red_enabled;
+	RebuildDemandedTracksUnlocked();
+	LogDemandedTracksUnlocked();
+}
+
+void RtcStream::ClearSessionDemandedTracks(session_id_t session_id)
+{
+	std::unique_lock<std::shared_mutex> lock(_demand_lock);
+	_session_demanded_tracks.erase(session_id);
+	RebuildDemandedTracksUnlocked();
+	LogDemandedTracksUnlocked();
+}
+
+bool RtcStream::IsTrackDemanded(uint32_t track_id) const
+{
+	std::shared_lock<std::shared_mutex> lock(_demand_lock);
+	return _demanded_tracks.find(track_id) != _demanded_tracks.end();
+}
+
+bool RtcStream::IsTrackFullyDemanded(uint32_t track_id) const
+{
+	std::shared_lock<std::shared_mutex> lock(_demand_lock);
+	return _fully_demanded_tracks.find(track_id) != _fully_demanded_tracks.end();
+}
+
+void RtcStream::RebuildDemandedTracksUnlocked()
+{
+	_demanded_tracks.clear();
+	_fully_demanded_tracks.clear();
+	_track_interested_sessions.clear();
+	for (const auto &entry : _session_demanded_tracks)
+	{
+		const auto session_id = entry.first;
+		const auto &demand = entry.second;
+		_fully_demanded_tracks.insert(demand.current_track_ids.begin(), demand.current_track_ids.end());
+		_demanded_tracks.insert(demand.current_track_ids.begin(), demand.current_track_ids.end());
+		_demanded_tracks.insert(demand.next_track_ids.begin(), demand.next_track_ids.end());
+
+		for (auto track_id : demand.current_track_ids)
+		{
+			_track_interested_sessions[track_id].insert(session_id);
+		}
+		for (auto track_id : demand.next_track_ids)
+		{
+			_track_interested_sessions[track_id].insert(session_id);
+		}
+	}
+}
+
+void RtcStream::LogDemandedTracksUnlocked() const
+{
+	ov::String full;
+	for (auto track_id : _fully_demanded_tracks)
+	{
+		if (full.IsEmpty() == false)
+		{
+			full.Append(",");
+		}
+		full.AppendFormat("%u", track_id);
+	}
+
+	ov::String keyframe_only;
+	for (auto track_id : _demanded_tracks)
+	{
+		if (_fully_demanded_tracks.find(track_id) != _fully_demanded_tracks.end())
+		{
+			continue;
+		}
+		if (keyframe_only.IsEmpty() == false)
+		{
+			keyframe_only.Append(",");
+		}
+		keyframe_only.AppendFormat("%u", track_id);
+	}
+
+	logti("RtcStream(%s/%s) - WebRTC track demand: sessions=%zu full=[%s] keyframe_only=[%s]",
+		  GetApplication()->GetVHostAppName().CStr(), GetName().CStr(),
+		  _session_demanded_tracks.size(),
+		  full.IsEmpty() ? "-" : full.CStr(),
+		  keyframe_only.IsEmpty() ? "-" : keyframe_only.CStr());
 }
 
 void RtcStream::SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet)
@@ -759,6 +1012,23 @@ void RtcStream::SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet)
 	if (_initial_media_packet_buffer.IsEmpty() == false)
 	{
 		SendBufferedPackets();
+	}
+
+	const auto track_id = media_packet->GetTrackId();
+
+	// Skip unused ladder rungs — packetizing every rendition for one viewer
+	// was the main remaining Fan-in cost after per-group pacers.
+	if (IsTrackDemanded(track_id) == false)
+	{
+		return;
+	}
+
+	// Pending ABR target: only keyframes are selectable until ChangeRendition.
+	// Packetizing the whole next rung (e.g. after AutoAbr OverUse with 2
+	// viewers) recreates the multi-rung stall we just removed.
+	if (IsTrackFullyDemanded(track_id) == false && media_packet->IsKeyFrame() == false)
+	{
+		return;
 	}
 
 	if (_pacer_enabled && PushToPacer(media_packet, arrival_time))
@@ -784,6 +1054,11 @@ void RtcStream::SendAudioFrame(const std::shared_ptr<MediaPacket> &media_packet)
 	if (_initial_media_packet_buffer.IsEmpty() == false)
 	{
 		SendBufferedPackets();
+	}
+
+	if (IsTrackDemanded(media_packet->GetTrackId()) == false)
+	{
+		return;
 	}
 
 	if (_pacer_enabled && PushToPacer(media_packet, arrival_time))
@@ -831,6 +1106,17 @@ bool RtcStream::SendBufferedPackets()
 		}
 
 		auto media_packet = buffered_media_packet.value();
+		const auto track_id = media_packet->GetTrackId();
+		if (IsTrackDemanded(track_id) == false)
+		{
+			continue;
+		}
+		if (media_packet->GetMediaType() == cmn::MediaType::Video &&
+			IsTrackFullyDemanded(track_id) == false &&
+			media_packet->IsKeyFrame() == false)
+		{
+			continue;
+		}
 		// Bypass the Pacer for buffered packets. The buffer accumulates
 		// frames during the Started→Prepared window so the first frame can be
 		// delivered properly once playback begins; routing them through the
@@ -894,6 +1180,7 @@ void RtcStream::PacketizeVideoFrame(const std::shared_ptr<MediaPacket> &media_pa
 	auto data		   = media_packet->GetData();
 	auto fragmentation = media_packet->GetFragHeader();
 
+	const auto packetize_started = std::chrono::steady_clock::now();
 	packetizer->Packetize(frame_type,
 						  static_cast<uint32_t>(timestamp),
 						  ntp_timestamp,
@@ -901,6 +1188,18 @@ void RtcStream::PacketizeVideoFrame(const std::shared_ptr<MediaPacket> &media_pa
 						  data->GetLength(),
 						  fragmentation,
 						  &rtp_video_header);
+	const auto packetize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+								  std::chrono::steady_clock::now() - packetize_started)
+								  .count();
+	// 16ms ≈ one frame at 60fps; sustained overruns on the pace thread stall that rung.
+	if (packetize_ms >= 16)
+	{
+		logtw("RtcStream(%s/%s) - PacketizeVideo track %u took %lldms (bytes=%zu key=%s bypass=%s)",
+			  GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), media_track->GetId(),
+			  static_cast<long long>(packetize_ms), data->GetLength(),
+			  frame_type == FrameType::VideoFrameKey ? "true" : "false",
+			  media_track->IsBypass() ? "true" : "false");
+	}
 }
 
 void RtcStream::PacketizeAudioFrame(const std::shared_ptr<MediaPacket> &media_packet)
@@ -1034,7 +1333,8 @@ void RtcStream::AddPacketizer(const std::shared_ptr<const MediaTrack> &track)
 
 	if (_ulpfec_enabled == true)
 	{
-		packetizer->SetUlpfec(static_cast<uint8_t>(FixedRtcPayloadType::RED_PAYLOAD_TYPE), static_cast<uint8_t>(FixedRtcPayloadType::ULPFEC_PAYLOAD_TYPE));
+		packetizer->SetUlpfec(static_cast<uint8_t>(FixedRtcPayloadType::RED_PAYLOAD_TYPE),
+							  static_cast<uint8_t>(FixedRtcPayloadType::ULPFEC_PAYLOAD_TYPE));
 	}
 
 	// Experimental : PlayoutDelay extension

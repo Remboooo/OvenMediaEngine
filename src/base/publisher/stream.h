@@ -1,6 +1,8 @@
 #pragma once
 
 #include <shared_mutex>
+#include <unordered_map>
+
 #include "base/common_types.h"
 #include "base/info/stream.h"
 #include "base/info/push.h"
@@ -25,14 +27,25 @@ namespace pub
 		bool AddSession(const std::shared_ptr<Session> &session);
 		bool RemoveSession(session_id_t id);
 		std::shared_ptr<Session> GetSession(session_id_t id);
+		bool HasSessions();
+		size_t GetSessionCount();
 
 		// Send to a specific session
 		void SendMessage(const std::shared_ptr<Session> &session, const std::any &message);
 
-		// Send to all sessions
+		// Send to all sessions on this worker
 		void SendPacket(const std::any &packet);
+		// Send to one session on this worker (avoids cross-rung IsSelectedPacket tax)
+		void SendPacketToSession(session_id_t session_id, const std::any &packet);
 
 	private:
+		struct WorkerPacket
+		{
+			std::any packet;
+			// 0 = deliver to every session on this worker; otherwise only that session
+			session_id_t session_id = 0;
+		};
+
 		void WorkerThread();
 
 		std::map<session_id_t, std::shared_ptr<Session>> _sessions;
@@ -40,8 +53,8 @@ namespace pub
 		
 		ov::Semaphore _queue_event;
 
-		std::optional<std::any> PopStreamPacket();
-		ov::ManagedQueue<std::any> _packet_queue;
+		std::optional<WorkerPacket> PopStreamPacket();
+		ov::ManagedQueue<WorkerPacket> _packet_queue;
 
 		struct SessionMessage
 		{
@@ -126,6 +139,8 @@ namespace pub
 
 		// A child call this function to delivery packet to all sessions
 		bool BroadcastPacket(const std::any &packet);
+		// Deliver only to the given sessions (routed to their StreamWorkers).
+		bool DeliverPacketToSessions(const std::any &packet, const std::vector<session_id_t> &session_ids);
 
 		bool SendMessage(const std::shared_ptr<Session> &session, const std::any &message);
 
@@ -195,6 +210,11 @@ namespace pub
 
 	private:
 		std::shared_ptr<StreamWorker> GetWorkerBySessionID(session_id_t session_id);
+		// Sticky least-loaded worker (not session_id%N) so two WebRTC viewers
+		// on different rungs do not serialize SRTP on one SW-WebRTC thread.
+		uint32_t AssignWorkerIndexForSession(session_id_t session_id);
+		void ReleaseWorkerIndexForSession(session_id_t session_id);
+
 		std::map<session_id_t, std::shared_ptr<Session>> _sessions;
 		std::shared_mutex _session_map_mutex;
 
@@ -202,6 +222,7 @@ namespace pub
 		
 		std::shared_mutex _stream_worker_lock;
 		std::vector<std::shared_ptr<StreamWorker>>	_stream_workers;
+		std::unordered_map<session_id_t, uint32_t> _session_worker_index;
 		std::shared_ptr<Application> _application;
 
 		session_id_t _last_issued_session_id;

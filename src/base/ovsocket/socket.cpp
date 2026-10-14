@@ -10,6 +10,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -1486,12 +1487,36 @@ namespace ov
 		msg.msg_control	   = control;
 		msg.msg_controllen = sizeof(control);
 
+		// UDP datagrams are atomic: EAGAIN means the whole packet was not queued.
+		// With the ICE path sending inline (no epoll dispatch retry), a single
+		// EAGAIN used to drop the packet permanently → client packetsLost.
+		// Wait briefly for SNDBUF space instead (backpressure into the caller).
+		// Bound EAGAIN wait: long enough to absorb keyframe bursts into SNDBUF,
+		// short enough not to freeze a session for hundreds of ms.
+		constexpr int kUdpSendRetryBudgetMs = 50;
+		auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kUdpSendRetryBudgetMs);
+
 		while ((remaining_bytes > 0L) && (force_stop == false))
 		{
 			const auto sent = ::sendmsg(socket_handle, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
 
 			if (sent < 0L)
 			{
+				const int err = errno;
+				if ((err == EAGAIN) || (err == EWOULDBLOCK))
+				{
+					const auto now = std::chrono::steady_clock::now();
+					if (now >= retry_deadline)
+					{
+						return false;
+					}
+					const auto left_ms = std::chrono::duration_cast<std::chrono::milliseconds>(retry_deadline - now).count();
+					pollfd pfd{};
+					pfd.fd = socket_handle;
+					pfd.events = POLLOUT;
+					::poll(&pfd, 1, static_cast<int>(std::max<int64_t>(1, left_ms)));
+					continue;
+				}
 				return false;
 			}
 
@@ -1502,6 +1527,10 @@ namespace ov
 			data_to_send += sent;
 			remaining_bytes -= sent;
 			*total_sent_bytes += sent;
+
+			// Keep iov in sync for partial TCP-style sends (UDP is usually one-shot).
+			iov.iov_base = const_cast<uint8_t *>(data_to_send);
+			iov.iov_len = remaining_bytes;
 		}
 
 		logtp("[#%d] %zu bytes sent", socket_handle, *total_sent_bytes);
@@ -1590,13 +1619,18 @@ namespace ov
 				return (SendFromToInternal(address_pair, data) == static_cast<ssize_t>(data->GetLength()));
 
 			case BlockingMode::NonBlocking:
+				// ICE WebRTC: many sessions share one UDP listening fd. Concurrent
+				// sendmsg() is safe on Linux. The epoll dispatch-queue path takes
+				// _dispatch_queue_lock for enqueue+send and serializes every
+				// viewer onto one mutex — multi-rung WebRTC then shows freezes
+				// with free cores and high voluntary context switches.
+				if (GetType() == SocketType::Udp)
+				{
+					return (SendFromToInternal(address_pair, data) == static_cast<ssize_t>(data->GetLength()));
+				}
 				if (IsSendable())
 				{
-					return AppendCommand(
-						(GetType() == SocketType::Udp)
-							? DispatchCommand(address_pair, data->Clone())
-							: DispatchCommand(data->Clone()),
-						true);
+					return AppendCommand(DispatchCommand(data->Clone()), true);
 				}
 		}
 

@@ -10,9 +10,12 @@
 #include <modules/http/server/web_socket/web_socket_session.h>
 #include <monitoring/monitoring.h>
 
+#include <atomic>
+#include <thread>
 #include <unordered_set>
 
 #include "base/info/media_track.h"
+#include "base/ovlibrary/queue.h"
 #include "base/publisher/session.h"
 #include "modules/dtls_srtp/dtls_transport.h"
 #include "modules/ice/ice_port.h"
@@ -103,12 +106,21 @@ public:
 		return _ice_session_id;
 	}
 
+	bool IsRedEnabled() const
+	{
+		return _red_enabled;
+	}
+
 private:
 	bool ProcessReceiverReport(const std::shared_ptr<RtcpInfo> &rtcp_info);
 	bool ProcessNACK(const std::shared_ptr<RtcpInfo> &rtcp_info);
 	bool ProcessTransportCc(const std::shared_ptr<RtcpInfo> &rtcp_info);
 	bool ProcessRemb(const std::shared_ptr<RtcpInfo> &rtcp_info);
 	bool IsSelectedPacket(const std::shared_ptr<const RtpPacket> &rtp_packet);
+	void ProcessOutgoingRtp(const std::shared_ptr<RtpPacket> &session_packet);
+	void StartSendThread();
+	void StopSendThread();
+	void SendThreadProc();
 
 	uint8_t GetOriginPayloadTypeFromRedRtpPacket(const std::shared_ptr<const RedRtpPacket> &red_rtp_packet);
 
@@ -142,6 +154,16 @@ private:
 
 	std::shared_mutex _start_stop_lock;
 
+	// Per-session send thread: pace/StreamWorker only enqueue; SRTP/ICE runs here
+	// so 4K+ULPFEC cannot stall other rungs or the packetize DelayQueue.
+	static constexpr size_t kMaxSendQueuePackets = 8000;
+	ov::Queue<std::shared_ptr<RtpPacket>> _send_queue{nullptr, kMaxSendQueuePackets};
+	std::thread _send_thread;
+	std::atomic<bool> _send_running{false};
+	std::atomic<uint64_t> _send_queue_drops{0};
+	std::atomic<uint64_t> _send_enqueued{0};
+	std::atomic<uint64_t> _send_processed{0};
+
 	ov::String _file_name;
 	std::shared_ptr<const RtcPlaylist> _playlist;
 
@@ -156,6 +178,8 @@ private:
 	std::shared_ptr<const RtcRendition> GetNextRendition() const;
 	void SetNextRendition(const std::shared_ptr<const RtcRendition> &rendition);
 	bool IsNextRenditionAvailable() const;
+	// Tell RtcStream which tracks this session needs (current + pending next).
+	void PublishTrackDemand();
 
 	std::shared_ptr<const RtcRendition> _current_rendition = nullptr;
 	std::shared_ptr<const RtcRendition> _next_rendition = nullptr;
