@@ -20,6 +20,8 @@
 #include <modules/rtp_rtcp/rtp_rtcp_defines.h>
 #include <modules/sdp/session_description.h>
 
+#include <atomic>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -149,14 +151,18 @@ private:
 
 	uint32_t _worker_count = 0;
 
-	// Per-pace-group resources (one DelayQueue thread + AdaptiveDelay per video
-	// rung; audio joins a video group only when uniquely paired — see
-	// BuildPaceGroupMap). Prevents a late ladder track from blocking bypass
-	// packetize or inflating bypass hold time.
+	// Per-pace-group resources (one DelayQueue for release timing + one
+	// packetize worker thread + AdaptiveDelay per video rung; audio joins a
+	// video group only when uniquely paired — see BuildPaceGroupMap).
+	// Packetize (esp. RED/ULPFEC on 4K) must not run on the DelayQueue thread
+	// or a single keyframe stalls every subsequently-due frame in the group.
 	struct PaceGroup
 	{
 		std::shared_ptr<ov::DelayQueue> scheduler;
 		std::shared_ptr<AdaptiveDelayController> adaptive;
+		ov::Queue<std::shared_ptr<MediaPacket>> packetize_queue{nullptr, 0};
+		std::thread packetize_thread;
+		std::atomic<bool> packetize_running{false};
 	};
 	std::map<uint32_t, std::shared_ptr<PaceGroup>> _pace_groups;
 	std::map<uint32_t, std::shared_ptr<FramePacer>> _pacers;

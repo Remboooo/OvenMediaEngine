@@ -59,6 +59,7 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 	}
 
 	int after_ms = 0;
+	uint32_t effective_delay_ms = 0;
 
 	bool warn_drift					= false;
 	bool warn_drift_was_calibrated	= false;
@@ -87,7 +88,25 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 													static_cast<double>(_timebase_num) * 1000000.0 /
 													static_cast<double>(_timebase_den));
 
-		if (!_anchor_set || (now - _last_push) > kAnchorIdleResetThreshold)
+		effective_delay_ms = _adaptive_controller
+								 ? static_cast<uint32_t>(_adaptive_controller->GetCurrentDelayMs())
+								 : _fallback_delay_ms;
+
+		// Hold disabled: keep decode-order pending queue but never wall-clock
+		// delay. (Drift reset used to require delay>0, so a drifted anchor
+		// could schedule frames 10s+ ahead and starve WebRTC send.)
+		if (effective_delay_ms == 0)
+		{
+			_last_push = now;
+			if (!_anchor_set)
+			{
+				_anchor_dts_us	= dts_us;
+				_anchor_arrival = now;
+				_anchor_set		= true;
+			}
+			after_ms = 0;
+		}
+		else if (!_anchor_set || (now - _last_push) > kAnchorIdleResetThreshold)
 		{
 			_anchor_dts_us			= dts_us;
 			_anchor_arrival			= now;
@@ -95,7 +114,11 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 			_anchor_calibrated		= false;
 			_calibration_samples_ms.clear();
 			_calibration_attempts	= 0;
+			_last_push = now;
+			after_ms = static_cast<int>(effective_delay_ms);
 		}
+		else
+		{
 		_last_push = now;
 
 		int64_t dts_diff_us = dts_us - _anchor_dts_us;
@@ -104,17 +127,17 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 		auto expected_arrival = _anchor_arrival + std::chrono::microseconds(dts_diff_us);
 		int64_t lateness_ms	  = std::chrono::duration_cast<std::chrono::milliseconds>(now - expected_arrival).count();
 
-		uint32_t effective_delay_ms = _adaptive_controller
-										  ? static_cast<uint32_t>(_adaptive_controller->GetCurrentDelayMs())
-										  : _fallback_delay_ms;
-
 		auto target = expected_arrival + std::chrono::milliseconds(effective_delay_ms);
 
 		auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(target - now).count();
 
-		// Anchor drift safety. Reset if target sits too far in the future.
-		if (effective_delay_ms > 0 &&
-			delta_ms > static_cast<int64_t>(effective_delay_ms) * kAnchorDriftMultiplier)
+		// Anchor drift safety. Floor at 250ms so delay=0 / small delay cannot
+		// schedule frames seconds into the future without resetting.
+		constexpr int64_t kMinDriftLimitMs = 250;
+		const int64_t drift_limit_ms =
+			std::max<int64_t>(static_cast<int64_t>(effective_delay_ms) * kAnchorDriftMultiplier,
+							  kMinDriftLimitMs);
+		if (delta_ms > drift_limit_ms)
 		{
 			if ((now - _last_drift_warn) >= kWarnThrottle)
 			{
@@ -187,7 +210,12 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 			_adaptive_controller->RecordSample(packet->GetTrackId(), lateness_ms);
 		}
 
-		after_ms = (delta_ms < 0) ? 0 : static_cast<int>(delta_ms);
+		// Hold from arrival by AdaptiveDelay only. DTS-target pacing scheduled
+		// after_ms = delay + N*frame_period during catch-up bursts, which
+		// Chrome reports as freezeEvents with packetsLost=0. Recording
+		// lateness still feeds AdaptiveDelay; release spacing is wall-clock.
+		after_ms = static_cast<int>(effective_delay_ms);
+		} // effective_delay_ms > 0, continuing after idle/first-frame branch
 	}
 
 	if (warn_drift)
@@ -245,6 +273,21 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 	// Capture by value so the lambda is independent of FramePacer lifetime.
 	auto dispatcher_copy = _dispatcher;
 	auto pending		 = _pending;
+
+	// after_ms > AdaptiveDelay means the DTS-ahead cap failed to apply; log it.
+	// Deep pending is normal during AdaptiveDelay hold (up to Max) — not a warn.
+	if (after_ms > static_cast<int>(effective_delay_ms) && effective_delay_ms > 0)
+	{
+		size_t pending_n = 0;
+		{
+			ov::LockGuard<ov::Mutex> lock(_pending->mutex);
+			pending_n = _pending->packets.size();
+		}
+		logtw("[%s] Pace schedule track=%u after_ms=%d delay=%u pending=%zu key=%s",
+			  _stream_id.CStr(), packet->GetTrackId(), after_ms, effective_delay_ms, pending_n,
+			  packet->IsKeyFrame() ? "true" : "false");
+	}
+
 	_scheduler->Push(
 		[dispatcher_copy, pending](void *) -> ov::DelayQueueAction {
 			std::shared_ptr<MediaPacket> next;

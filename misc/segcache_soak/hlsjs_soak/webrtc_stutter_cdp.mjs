@@ -144,9 +144,13 @@ async function main() {
   const pages = [];
   for (const c of clients) {
     const page = await context.newPage();
+    // Put rendition on the signalling URL so OME adopts it at session create
+    // (before first video), not after ICE-connected change_rendition.
+    const sep = wsBase.includes('?') ? '&' : '?';
+    const wsWithRendition = `${wsBase}${sep}rendition=${encodeURIComponent(c.rendition)}`;
     const pageUrl =
       `http://${publicHost}:${staticPort}/webrtc_stutter.html` +
-      `?ws=${encodeURIComponent(wsBase)}` +
+      `?ws=${encodeURIComponent(wsWithRendition)}` +
       `&rendition=${encodeURIComponent(c.rendition)}` +
       `&label=${encodeURIComponent(c.label)}` +
       `&warmup=${encodeURIComponent(String(warmupS))}` +

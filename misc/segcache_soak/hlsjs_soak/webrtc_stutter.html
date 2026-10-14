@@ -87,16 +87,6 @@ ws.onmessage = async (event) => {
       if (pc.connectionState === 'connected') {
         out.state = 'playing';
         startedAt = performance.now();
-        if (rendition && !out.renditionSent) {
-          out.renditionSent = true;
-          ws.send(JSON.stringify({
-            command: 'change_rendition',
-            id: sessionId,
-            peer_id: peerId,
-            rendition_name: rendition,
-            auto: false,
-          }));
-        }
       }
       if (pc.connectionState === 'failed') out.error = 'peer connection failed';
     };
@@ -106,6 +96,18 @@ ws.onmessage = async (event) => {
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     ws.send(JSON.stringify({ command: 'answer', id: sessionId, peer_id: peerId, sdp: answer }));
+    // Session is created on answer. Ask for the target rung immediately so OME
+    // can adopt it before the first video packet when ?rendition= was omitted.
+    if (rendition && !out.renditionSent) {
+      out.renditionSent = true;
+      ws.send(JSON.stringify({
+        command: 'change_rendition',
+        id: sessionId,
+        peer_id: peerId,
+        rendition_name: rendition,
+        auto: false,
+      }));
+    }
   } catch (e) {
     out.error = String(e);
   }

@@ -17,22 +17,23 @@
 
 #include "adaptive_delay_controller.h"
 
-// Per-track DTS-anchored sender-side frame pacer.
+// Per-track sender-side frame pacer (WebRTC JitterBuffer path).
 //
-// Schedules each frame's dispatch on a shared ov::DelayQueue (one worker
-// thread shared across all tracks of a stream). Frames may arrive in bursts
-// due to encoder delays, network conditions, or sender-side pacing; without
-// smoothing, WebRTC players render them at the burst rate, causing uneven
-// playback. This pacer dispatches each frame at its DTS-derived expected
-// time instead:
-//   target = anchor_arrival + (frame.dts - anchor.dts) + delay
-// DTS is used (not PTS) so B-frame content keeps its decode order, and frames
-// are always dispatched in push order regardless of their computed targets.
-// The first frame after a long idle (or the first ever) establishes a fresh
-// anchor.
+// Schedules each frame's dispatch on a shared ov::DelayQueue. Frames may
+// arrive in bursts; without smoothing, players render at the burst rate.
+// Release is a fixed hold from wall-clock arrival:
+//   after_ms = current AdaptiveDelay (or fallback)
+// DTS is still tracked so AdaptiveDelay can record lateness and so drift
+// resets keep the anchor sane, but after_ms is NOT DTS-target pacing.
+// DTS-ahead scheduling (after_ms = delay + N*frame_period during catch-up)
+// produced Chrome freezeEvents with packetsLost=0 under 4K+ULPFEC.
+//
+// Frames always leave in push (decode) order via the pending queue, even if
+// millisecond rounding would otherwise reorder targets. DTS (not PTS) is used
+// for lateness so B-frame content stays decode-ordered.
 //
 // When attached to a shared AdaptiveDelayController, the delay is queried per
-// frame and reflects the current adaptive estimate (Min == Max pins it fixed).
+// frame (Min == Max pins a fixed hold — preferred for concurrent 4K WebRTC).
 class FramePacer
 {
 public:

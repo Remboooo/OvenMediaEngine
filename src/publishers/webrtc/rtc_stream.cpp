@@ -25,11 +25,16 @@
 
 using namespace cmn;
 
-// Internal jitter-buffer bounds. The user-facing config is just
-// <JitterBuffer>true</JitterBuffer>; the operating point inside these bounds
-// is derived from observed jitter (see AdaptiveDelayController).
-static constexpr int kPacerMinMs = 20;
-static constexpr int kPacerMaxMs = 500;
+// <JitterBuffer>true</JitterBuffer> (see docs/streaming/webrtc-publishing.md)
+// enables a sender-side smoothing hold so bursty ingress is released evenly.
+// We pin Min==Max rather than letting AdaptiveDelay climb: under simultaneous
+// 4K Bypass+ULPFEC + ladder rungs, delay step-ups opened ≥200ms decode gaps
+// (Chrome freezeEvents/freezeCount with packetsLost=0). A fixed 80ms hold still
+// matches the documented "even spacing" behaviour and stays well under a
+// ≤500ms extra E2E latency budget. Packetize always runs on DelayQueue workers
+// regardless of this flag (see PaceGroup).
+static constexpr int kPacerMinMs = 80;
+static constexpr int kPacerMaxMs = 80;
 
 /***************************
  SDP Sample
@@ -156,6 +161,14 @@ bool RtcStream::Start()
 	// with concurrent transcoded rungs on the media thread (JB=false used
 	// to Packetize inline and the passthrough froze first).
 	_jitter_buffer_enabled = webrtc_config.IsJitterBufferEnabled();
+	// Diagnostic A/B: OME_WEBRTC_DISABLE_JITTERBUFFER=1 keeps DelayQueue
+	// packetize offload but sets AdaptiveDelay hold to 0.
+	if (const char *disable_jb = std::getenv("OME_WEBRTC_DISABLE_JITTERBUFFER");
+		disable_jb != nullptr && disable_jb[0] == '1')
+	{
+		logtw("RtcStream - OME_WEBRTC_DISABLE_JITTERBUFFER=1: AdaptiveDelay hold disabled");
+		_jitter_buffer_enabled = false;
+	}
 	_pacer_enabled		   = true;
 
 	if (webrtc_config.GetBandwidthEstimationType() == RtcBWEType::TransportCc)
@@ -302,8 +315,52 @@ bool RtcStream::Start()
 						ov::String::FormatString("%s#g%u", stream_label.CStr(), group_id),
 						kPacerMinMs, kPacerMaxMs);
 				}
+				// Packetize off the DelayQueue thread: RED/ULPFEC on 4K keyframes
+				// otherwise HOL-stalls every subsequently-due frame in the group
+				// (freezeCount>0, packetsLost=0). Ordering preserved via FIFO queue.
+				group->packetize_queue.SetAlias(
+					ov::String::FormatString("RtcPkz%u", group_id).CStr());
+				group->packetize_running.store(true, std::memory_order_release);
+				std::weak_ptr<PaceGroup> group_weak = group;
+				group->packetize_thread = std::thread([stream_weak, group_weak, group_id]() {
+					ov::logger::ThreadHelper thread_helper;
+					auto name = ov::String::FormatString("RtcPkz%u", group_id);
+					::pthread_setname_np(pthread_self(), name.CStr());
+					while (true)
+					{
+						auto group_locked = group_weak.lock();
+						if (group_locked == nullptr)
+						{
+							break;
+						}
+						auto pkt = group_locked->packetize_queue.Dequeue();
+						group_locked.reset();
+						if (pkt.has_value() == false)
+						{
+							break;
+						}
+						auto stream = stream_weak.lock();
+						if (stream == nullptr)
+						{
+							continue;
+						}
+						auto rtc_stream = std::dynamic_pointer_cast<RtcStream>(stream);
+						if (rtc_stream == nullptr)
+						{
+							continue;
+						}
+						if (pkt.value()->GetMediaType() == cmn::MediaType::Video)
+						{
+							rtc_stream->PacketizeVideoFrame(pkt.value());
+						}
+						else
+						{
+							rtc_stream->PacketizeAudioFrame(pkt.value());
+						}
+					}
+				});
 				_pace_groups[group_id] = group;
-				logti("RtcStream(%s) - Pace group %u started (DelayQueue%s)",
+				logti("RtcStream(%s) - Pace group %u started (DelayQueue+PacketizeWorker%s)",
 					  stream_label.CStr(), group_id,
 					  _jitter_buffer_enabled ? "+AdaptiveDelay" : ", delay=0");
 			}
@@ -314,19 +371,9 @@ bool RtcStream::Start()
 				track->GetTimeBase().GetDen(),
 				pacer_delay_ms);
 
-			bool is_video = (track->GetMediaType() == cmn::MediaType::Video);
 			pacer->Init(group->scheduler,
-						[stream_weak, is_video](const std::shared_ptr<MediaPacket> &pkt) {
-							auto stream = stream_weak.lock();
-							if (!stream)
-								return;
-							auto rtc_stream = std::dynamic_pointer_cast<RtcStream>(stream);
-							if (!rtc_stream)
-								return;
-							if (is_video)
-								rtc_stream->PacketizeVideoFrame(pkt);
-							else
-								rtc_stream->PacketizeAudioFrame(pkt);
+						[group](const std::shared_ptr<MediaPacket> &pkt) {
+							group->packetize_queue.Enqueue(pkt);
 						});
 			if (group->adaptive != nullptr)
 			{
@@ -400,9 +447,20 @@ bool RtcStream::Stop()
 	}
 	for (auto &[_, group] : _pace_groups)
 	{
-		if (group && group->scheduler)
+		if (group == nullptr)
+		{
+			continue;
+		}
+		// Stop release timers first so they stop feeding the packetize queue.
+		if (group->scheduler)
 		{
 			group->scheduler->Stop();
+		}
+		group->packetize_running.store(false, std::memory_order_release);
+		group->packetize_queue.Stop();
+		if (group->packetize_thread.joinable())
+		{
+			group->packetize_thread.join();
 		}
 	}
 	_pace_groups.clear();
@@ -887,7 +945,9 @@ bool RtcStream::OnRtpPacketized(std::shared_ptr<RtpPacket> packet)
 		session->SendOutgoingData(stream_packet);
 	}
 
-	if (target_sessions.empty() == false && _rtx_enabled == true)
+	// Skip ULPFEC parity in RTX history — not useful for NACK recovery, and
+	// leaving them unshared lets ProcessOutgoingRtp SRTP in place (use_count==1).
+	if (target_sessions.empty() == false && _rtx_enabled == true && packet->IsUlpfec() == false)
 	{
 		auto history = GetHistory(packet->GetTrackId(), packet->PayloadType());
 		if (history != nullptr)

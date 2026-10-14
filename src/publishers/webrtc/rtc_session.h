@@ -50,7 +50,8 @@ public:
 											  const std::shared_ptr<const SessionDescription> &peer_sdp,
 											  const std::shared_ptr<IcePort> &ice_port,
 											  session_id_t ice_session_id,
-											  const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session);
+											  const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session,
+											  const ov::String &initial_rendition = "");
 
 	RtcSession(const info::Session &session_info,
 			   const std::shared_ptr<WebRtcPublisher> &publisher,
@@ -61,7 +62,8 @@ public:
 			   const std::shared_ptr<const SessionDescription> &peer_sdp,
 			   const std::shared_ptr<IcePort> &ice_port,
 			   session_id_t ice_session_id,
-			   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session);
+			   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session,
+			   const ov::String &initial_rendition = "");
 	~RtcSession() override;
 
 	bool Start() override;
@@ -121,6 +123,7 @@ private:
 	void StartSendThread();
 	void StopSendThread();
 	void SendThreadProc();
+	void FinishKeyframeDrain(const char *reason);
 
 	uint8_t GetOriginPayloadTypeFromRedRtpPacket(const std::shared_ptr<const RedRtpPacket> &red_rtp_packet);
 
@@ -164,7 +167,26 @@ private:
 	std::atomic<uint64_t> _send_enqueued{0};
 	std::atomic<uint64_t> _send_processed{0};
 
+	// Keyframe send-drain instrumentation (seq assigned here → HOL freezes).
+	bool _kf_drain_active = false;
+	bool _kf_drain_seen_marker = false;
+	uint32_t _kf_drain_timestamp = 0;
+	std::chrono::steady_clock::time_point _kf_drain_start{};
+	uint32_t _kf_drain_packets = 0;
+	uint32_t _kf_drain_fec_packets = 0;
+	uint64_t _kf_drain_bytes = 0;
+	uint64_t _kf_drain_copy_ns = 0;
+	uint64_t _kf_drain_send_ns = 0;
+	size_t _kf_drain_q_start = 0;
+	int64_t _kf_drain_max_age_ms = 0;
+
+	// Video send-gap detector: pacer/packetize stalls show as packetsLost=0 freezes.
+	bool _have_sent_video = false;
+	std::chrono::steady_clock::time_point _last_video_sent{};
+	std::chrono::steady_clock::time_point _last_send_gap_warn{};
+
 	ov::String _file_name;
+	ov::String _initial_rendition;
 	std::shared_ptr<const RtcPlaylist> _playlist;
 
 	uint16_t _video_rtp_sequence_number = 0;

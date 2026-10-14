@@ -14,8 +14,8 @@ RtpPacketizer::RtpPacketizer(const std::shared_ptr<RtpPacketizerInterface> &sess
 
 	_audio_configured = false;
 	_timestamp_offset = (uint32_t)rand();
-	_sequence_number = (uint16_t)rand();
-	_red_sequence_number = (uint16_t)rand();
+	_sequence_state->sequence_number = (uint16_t)rand();
+	_sequence_state->red_sequence_number = (uint16_t)rand();
 	_ulpfec_enabled = false;
 }
 
@@ -222,12 +222,16 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 		}
 
 		_rtp_packet_count ++;
-		_stream->OnRtpPacketized(packet);
-
-		// RED First
-		if(_ulpfec_enabled)
+		// When ULPFEC/RED is enabled the session only accepts RED (or FEC)
+		// payloads — fan-out of the raw RTP packet is wasted work and on 4K
+		// bypass doubles DelayQueue/send pressure enough to freeze.
+		if (_ulpfec_enabled)
 		{
 			GenerateRedAndFecPackets(packet);
+		}
+		else
+		{
+			_stream->OnRtpPacketized(packet);
 		}
 	}
 
@@ -236,42 +240,87 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 
 bool RtpPacketizer::GenerateRedAndFecPackets(std::shared_ptr<RtpPacket> packet)
 {
-	// Send RED
+	// Media RED first, then FEC. Encode/XOR on the marker packet used to run
+	// before OnRtpPacketized of that media packet — delaying the last slice of
+	// every 4K frame by the full FEC cost and opening decode gaps.
 	auto red_packet = PackageAsRed(packet);
 
 	// Separate the sequence number of the RED packet from RTP packet.
 	// Because FEC packet should not affect the sequence number of the RTP packet.
 	AssignSequenceNumber(red_packet.get(), true);
 
-	if (_ulpfec_generate_fec)
-	{
-		_ulpfec_generator.AddRtpPacketAndGenerateFec(red_packet);
-	}
 	red_packet->PackageAsRtp();
 	_stream->OnRtpPacketized(red_packet);
 
-	while (_ulpfec_generate_fec && _ulpfec_generator.IsAvailableFecPackets())
+	if (_ulpfec_generate_fec == false)
 	{
-		auto red_fec_packet = AllocatePacket(true);
-
-		// RED packet is for only video 
-		red_fec_packet->SetVideoPacket(true);
-
-		// Timestamp is same as last packet
-		red_fec_packet->SetTimestamp(packet->Timestamp());
-
-		// Sequence Number
-		AssignSequenceNumber(red_fec_packet.get(), true);
-
-		_ulpfec_generator.NextPacket(red_fec_packet.get());
-
-		// Adjust completed red packet's payload offset and size for RTX packet
-		std::dynamic_pointer_cast<RedRtpPacket>(red_fec_packet)->PackageAsRtp();
-
-		// Send ULPFEC
-		_rtp_packet_count ++;
-		_stream->OnRtpPacketized(red_fec_packet);
+		return true;
 	}
+
+	// ULPFEC is still generated for every frame (config semantics unchanged).
+	// Encode/XOR of a 4K keyframe used to run inline on the packetize thread
+	// at the marker packet and HOL-stall the next frame (≥200ms Chrome gaps,
+	// packetsLost=0). Media RED is already on the wire above; defer Encode+
+	// FEC emit to a detached worker. SequenceState is a shared_ptr so the
+	// worker can safely assign RED sequence numbers after this packetizer
+	// returns (and briefly after stream teardown starts).
+	_ulpfec_generator.AddMediaPacket(red_packet);
+	if (packet->Marker() == false)
+	{
+		return true;
+	}
+
+	auto media = _ulpfec_generator.StealMediaPackets();
+	const uint32_t track_id = media.empty() ? 0 : media.front()->GetTrackId();
+	struct FecEmitState
+	{
+		std::shared_ptr<SequenceState> seq;
+		std::shared_ptr<RtpPacketizerInterface> stream;
+		uint32_t ssrc = 0;
+		std::vector<uint32_t> csrcs;
+		uint8_t ulpfec_pt = 0;
+		uint8_t media_pt = 0;
+		uint32_t ts = 0;
+		uint32_t track_id = 0;
+		std::vector<std::shared_ptr<RedRtpPacket>> media;
+	};
+	auto state		 = std::make_shared<FecEmitState>();
+	state->seq		 = _sequence_state;
+	state->stream	 = _stream;
+	state->ssrc		 = _ssrc;
+	state->csrcs	 = _csrcs;
+	state->ulpfec_pt = _ulpfec_payload_type;
+	state->media_pt	 = _payload_type;
+	state->ts		 = packet->Timestamp();
+	state->track_id	 = track_id;
+	state->media	 = std::move(media);
+
+	std::thread([state]() {
+		UlpfecGenerator gen;
+		gen.AdoptMediaPackets(std::move(state->media));
+		gen.EncodePending();
+		while (gen.IsAvailableFecPackets())
+		{
+			auto red_fec_packet = std::make_shared<RedRtpPacket>();
+			red_fec_packet->SetSsrc(state->ssrc);
+			red_fec_packet->SetCsrcs(state->csrcs);
+			red_fec_packet->SetPayloadType(state->ulpfec_pt);
+			red_fec_packet->SetUlpfec(true, state->media_pt);
+			red_fec_packet->SetTrackId(state->track_id);
+			red_fec_packet->SetVideoPacket(true);
+			red_fec_packet->SetTimestamp(state->ts);
+			{
+				std::lock_guard<std::mutex> lock(state->seq->mutex);
+				red_fec_packet->SetSequenceNumber(state->seq->red_sequence_number++);
+			}
+			gen.NextPacket(red_fec_packet.get());
+			red_fec_packet->PackageAsRtp();
+			if (state->stream)
+			{
+				state->stream->OnRtpPacketized(red_fec_packet);
+			}
+		}
+	}).detach();
 
 	return true;
 }
@@ -355,13 +404,14 @@ std::shared_ptr<RtpPacket> RtpPacketizer::AllocatePacket(bool ulpfec)
 
 bool RtpPacketizer::AssignSequenceNumber(RtpPacket *packet, bool red)
 {
-	if(!red)
+	std::lock_guard<std::mutex> lock(_sequence_state->mutex);
+	if (!red)
 	{
-		packet->SetSequenceNumber(_sequence_number++);
+		packet->SetSequenceNumber(_sequence_state->sequence_number++);
 	}
 	else
 	{
-		packet->SetSequenceNumber(_red_sequence_number++);
+		packet->SetSequenceNumber(_sequence_state->red_sequence_number++);
 	}
 
 	return true;

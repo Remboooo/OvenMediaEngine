@@ -31,11 +31,12 @@ std::shared_ptr<RtcSession> RtcSession::Create(const std::shared_ptr<WebRtcPubli
 											   const std::shared_ptr<const SessionDescription> &peer_sdp,
 											   const std::shared_ptr<IcePort> &ice_port,
 											   session_id_t ice_session_id,
-											   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session)
+											   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session,
+											   const ov::String &initial_rendition)
 {
 	// Session Id of the offer sdp is unique value
 	auto session_info = info::Session(*std::static_pointer_cast<info::Stream>(stream), offer_sdp->GetSessionId());
-	auto session	  = std::make_shared<RtcSession>(session_info, publisher, application, stream, file_name, offer_sdp, peer_sdp, ice_port, ice_session_id, ws_session);
+	auto session	  = std::make_shared<RtcSession>(session_info, publisher, application, stream, file_name, offer_sdp, peer_sdp, ice_port, ice_session_id, ws_session, initial_rendition);
 	if (!session->Start())
 	{
 		return nullptr;
@@ -52,7 +53,8 @@ RtcSession::RtcSession(const info::Session &session_info,
 					   const std::shared_ptr<const SessionDescription> &peer_sdp,
 					   const std::shared_ptr<IcePort> &ice_port,
 					   session_id_t ice_session_id,
-					   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session)
+					   const std::shared_ptr<http::svr::ws::WebSocketSession> &ws_session,
+					   const ov::String &initial_rendition)
 	: Session(session_info, application, stream), Node(NodeType::Edge)
 {
 	_publisher		= publisher;
@@ -62,6 +64,7 @@ RtcSession::RtcSession(const info::Session &session_info,
 	_ice_session_id = ice_session_id;
 	_ws_session		= ws_session;
 	_file_name		= file_name;
+	_initial_rendition = initial_rendition;
 }
 
 RtcSession::~RtcSession()
@@ -193,6 +196,27 @@ bool RtcSession::Start()
 
 	_auto_abr = _playlist->IsWebRtcAutoAbr();
 	_current_rendition = _playlist->GetFirstRendition();
+	// Optional initial rendition (signalling URL ?rendition=Name, see
+	// WebRtcPublisher::OnAddRemoteDescription). Without this, every auto-
+	// playlist session starts on GetFirstRendition() — often Bypass — until a
+	// later change_rendition+keyframe. N concurrent viewers briefly force N×
+	// the top rung onto the wire (observed as simultaneous identical
+	// RtcKfDrain lines and 4K+ULPFEC freezes under the all3 soak).
+	if (_initial_rendition.IsEmpty() == false)
+	{
+		auto requested = _playlist->GetRendition(_initial_rendition);
+		if (requested != nullptr)
+		{
+			_current_rendition = requested;
+			// Explicit rung selection disables auto ABR for this session.
+			_auto_abr = false;
+		}
+		else
+		{
+			logtw("Initial rendition %s not in playlist %s — using first rendition",
+				  _initial_rendition.CStr(), _file_name.CStr());
+		}
+	}
 
 	auto current_video_track = _current_rendition->GetVideoTrack();
 	auto current_audio_track = _current_rendition->GetAudioTrack();
@@ -258,6 +282,34 @@ void RtcSession::StopSendThread()
 	}
 }
 
+void RtcSession::FinishKeyframeDrain(const char *reason)
+{
+	if (_kf_drain_active == false)
+	{
+		return;
+	}
+
+	const auto drain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+							  std::chrono::steady_clock::now() - _kf_drain_start)
+							  .count();
+	const double copy_ms = static_cast<double>(_kf_drain_copy_ns) / 1.0e6;
+	const double send_ms = static_cast<double>(_kf_drain_send_ns) / 1.0e6;
+
+	// Log drains that can produce a visible freeze (~2 frames @ 60fps) or deep queue.
+	if (drain_ms >= 50 || _kf_drain_packets >= 150 || _kf_drain_q_start >= 64 ||
+		_send_queue.Size() >= 64)
+	{
+		logtw("RtcKfDrain session=%u reason=%s pkts=%u fec=%u bytes=%" PRIu64
+			  " drain_ms=%lld q0=%zu max_age_ms=%lld copy_ms=%.1f send_ms=%.1f queue_now=%zu",
+			  GetId(), reason, _kf_drain_packets, _kf_drain_fec_packets, _kf_drain_bytes,
+			  static_cast<long long>(drain_ms), _kf_drain_q_start,
+			  static_cast<long long>(_kf_drain_max_age_ms), copy_ms, send_ms, _send_queue.Size());
+	}
+
+	_kf_drain_active = false;
+	_kf_drain_seen_marker = false;
+}
+
 void RtcSession::SendThreadProc()
 {
 	ov::logger::ThreadHelper thread_helper;
@@ -272,6 +324,10 @@ void RtcSession::SendThreadProc()
 		auto packet = _send_queue.Dequeue();
 		if (packet.has_value() == false)
 		{
+			if (_kf_drain_active)
+			{
+				FinishKeyframeDrain("queue_stop");
+			}
 			break;
 		}
 
@@ -376,6 +432,24 @@ bool RtcSession::RequestChangeRendition(const ov::String &rendition_name)
 	if (rendition == GetCurrentRendition())
 	{
 		logtt("The rendition (%s) is already selected", rendition_name.CStr());
+		return true;
+	}
+
+	// Before any selected video has been sent, adopt immediately. Auto-playlist
+	// sessions otherwise all start on GetFirstRendition() (often Bypass) until
+	// the first keyframe after change_rendition — N viewers briefly force N×
+	// the top rung onto the wire (4K+ULPFEC freezes under simultaneous soak).
+	if (_video_rtp_sequence_number == 0 && IsNextRenditionAvailable() == false)
+	{
+		{
+			std::unique_lock<std::shared_mutex> lock(_change_rendition_lock);
+			_current_rendition = rendition;
+			_next_rendition	  = nullptr;
+		}
+		PublishTrackDemand();
+		SendRenditionChanged(_current_rendition);
+		logti("Session %u adopted rendition %s before first video packet",
+			  GetId(), rendition_name.CStr());
 		return true;
 	}
 
@@ -761,39 +835,137 @@ void RtcSession::ProcessOutgoingRtp(const std::shared_ptr<RtpPacket> &session_pa
 		return;
 	}
 
-	// RTP packet must be copied: SRTP alters the buffer, and ULPFEC/RTX may
-	// still reference the original.
-	auto copy_packet = std::make_shared<RtpPacket>(*session_packet);
+	const bool is_video = session_packet->IsVideoPacket();
+	const bool is_fec = session_packet->IsUlpfec();
+	const bool is_key_media = is_video && session_packet->IsKeyframe() && (is_fec == false);
 
-	auto &media_rtp_sequence_number = copy_packet->IsVideoPacket() ? _video_rtp_sequence_number : _audio_rtp_sequence_number;
-	copy_packet->SetSequenceNumber(media_rtp_sequence_number++);
+	// Start/extend keyframe drain window (media + trailing FEC of same timestamp).
+	if (is_key_media && session_packet->IsFirstPacketOfFrame())
+	{
+		if (_kf_drain_active)
+		{
+			FinishKeyframeDrain("new_keyframe");
+		}
+		_kf_drain_active = true;
+		_kf_drain_seen_marker = false;
+		_kf_drain_timestamp = session_packet->Timestamp();
+		_kf_drain_start = std::chrono::steady_clock::now();
+		_kf_drain_packets = 0;
+		_kf_drain_fec_packets = 0;
+		_kf_drain_bytes = 0;
+		_kf_drain_copy_ns = 0;
+		_kf_drain_send_ns = 0;
+		_kf_drain_q_start = _send_queue.Size();
+		_kf_drain_max_age_ms = 0;
+	}
+	else if (_kf_drain_active && is_video &&
+			 session_packet->Timestamp() != _kf_drain_timestamp)
+	{
+		FinishKeyframeDrain("ts_change");
+	}
+
+	if (_kf_drain_active)
+	{
+		const auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+								std::chrono::system_clock::now() - session_packet->GetCreatedTime())
+								.count();
+		if (age_ms > _kf_drain_max_age_ms)
+		{
+			_kf_drain_max_age_ms = age_ms;
+		}
+	}
+
+	// Exclusive packets (typical: ULPFEC with no RTX history share) can SRTP
+	// in place. Shared packets must be copied — SRTP mutates the buffer.
+	const auto t_copy0 = std::chrono::steady_clock::now();
+	std::shared_ptr<RtpPacket> send_packet;
+	const bool exclusive = (session_packet.use_count() == 1);
+	if (exclusive)
+	{
+		send_packet = session_packet;
+	}
+	else
+	{
+		send_packet = std::make_shared<RtpPacket>(*session_packet);
+	}
+	const auto copy_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+							 std::chrono::steady_clock::now() - t_copy0)
+							 .count();
+
+	auto &media_rtp_sequence_number = send_packet->IsVideoPacket() ? _video_rtp_sequence_number : _audio_rtp_sequence_number;
+	const uint16_t origin_sequence_number = session_packet->SequenceNumber();
+	send_packet->SetSequenceNumber(media_rtp_sequence_number++);
 
 	// Set transport-wide sequence number
-	bool media_transport_cc_enabled = copy_packet->IsVideoPacket() ? _video_transport_cc_enabled : _audio_transport_cc_enabled;
+	bool media_transport_cc_enabled = send_packet->IsVideoPacket() ? _video_transport_cc_enabled : _audio_transport_cc_enabled;
 
 	if (media_transport_cc_enabled)
 	{
-		SetTransportWideSequenceNumber(copy_packet, _wide_sequence_number);
+		SetTransportWideSequenceNumber(send_packet, _wide_sequence_number);
 	}
 
-	SetAbsSendTime(copy_packet, ov::Clock::NowMSec());
+	SetAbsSendTime(send_packet, ov::Clock::NowMSec());
 
+	const auto t_send0 = std::chrono::steady_clock::now();
 	// rtp_rtcp -> srtp -> dtls -> Edge Node(RtcSession)
-	_rtp_rtcp->SendRtpPacket(copy_packet);
+	_rtp_rtcp->SendRtpPacket(send_packet);
+	const auto send_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+							 std::chrono::steady_clock::now() - t_send0)
+							 .count();
 
-	RecordRtpSent(copy_packet, session_packet->SequenceNumber(), media_transport_cc_enabled ? _wide_sequence_number : 0);
+	if (is_video && (is_fec == false))
+	{
+		const auto gap_ms = _have_sent_video
+								? std::chrono::duration_cast<std::chrono::milliseconds>(
+									  t_send0 - _last_video_sent)
+									  .count()
+								: 0;
+		if (_have_sent_video && gap_ms >= 200 &&
+			(t_send0 - _last_send_gap_warn) >= std::chrono::milliseconds(500))
+		{
+			_last_send_gap_warn = t_send0;
+			logtw("RtcSendGap session=%u gap_ms=%lld queue=%zu key=%s age_ms=%lld",
+				  GetId(), static_cast<long long>(gap_ms), _send_queue.Size(),
+				  is_key_media ? "true" : "false",
+				  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+											 std::chrono::system_clock::now() -
+											 session_packet->GetCreatedTime())
+											 .count()));
+		}
+		_last_video_sent = t_send0;
+		_have_sent_video = true;
+	}
+
+	RecordRtpSent(send_packet, origin_sequence_number, media_transport_cc_enabled ? _wide_sequence_number : 0);
 
 	if (media_transport_cc_enabled)
 	{
 		if (_bandwidth_estimator != nullptr)
 		{
-			_bandwidth_estimator->OnRtpSent(_wide_sequence_number, copy_packet);
+			_bandwidth_estimator->OnRtpSent(_wide_sequence_number, send_packet);
 		}
 
 		_wide_sequence_number++;
 	}
 
-	MonitorInstance->IncreaseBytesOut(*GetStream(), PublisherType::Webrtc, copy_packet->GetDataLength());
+	MonitorInstance->IncreaseBytesOut(*GetStream(), PublisherType::Webrtc, send_packet->GetDataLength());
+
+	if (_kf_drain_active)
+	{
+		_kf_drain_packets++;
+		_kf_drain_bytes += send_packet->GetDataLength();
+		_kf_drain_copy_ns += static_cast<uint64_t>(copy_ns);
+		_kf_drain_send_ns += static_cast<uint64_t>(send_ns);
+		if (is_fec)
+		{
+			_kf_drain_fec_packets++;
+		}
+		if (is_key_media && session_packet->Marker())
+		{
+			_kf_drain_seen_marker = true;
+		}
+		// Drain ends on timestamp change (next frame) — see top of this function.
+	}
 }
 
 bool RtcSession::SetTransportWideSequenceNumber(const std::shared_ptr<RtpPacket> &rtp_packet, uint16_t wide_sequence_number)

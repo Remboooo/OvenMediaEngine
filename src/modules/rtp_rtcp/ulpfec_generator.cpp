@@ -26,12 +26,38 @@ void UlpfecGenerator::SetHighRateProtection(bool high_level)
 	_high_level = high_level;
 }
 
+bool UlpfecGenerator::AddMediaPacket(std::shared_ptr<RedRtpPacket> packet)
+{
+	_media_packets.push_back(std::make_shared<RedRtpPacket>(*packet));
+	return true;
+}
+
+void UlpfecGenerator::AdoptMediaPackets(std::vector<std::shared_ptr<RedRtpPacket>> &&packets)
+{
+	_media_packets = std::move(packets);
+}
+
+bool UlpfecGenerator::EncodePending()
+{
+	if (_media_packets.empty())
+	{
+		return false;
+	}
+	return Encode();
+}
+
+std::vector<std::shared_ptr<RedRtpPacket>> UlpfecGenerator::StealMediaPackets()
+{
+	std::vector<std::shared_ptr<RedRtpPacket>> out;
+	out.swap(_media_packets);
+	return out;
+}
+
 bool UlpfecGenerator::AddRtpPacketAndGenerateFec(std::shared_ptr<RedRtpPacket> packet)
 {
-	auto copy_packet = std::make_shared<RedRtpPacket>(*packet);
-	_media_packets.push_back(copy_packet);
+	AddMediaPacket(packet);
 
-	if(copy_packet->Marker())
+	if (packet->Marker())
 	{
 		Encode();
 	}

@@ -51,6 +51,14 @@ public:
 	// Because RTP is already being sent out, we execute ulpfec using the newly created red packet.
 	// I used this technique to reduce the copying and improve performance.
 	bool AddRtpPacketAndGenerateFec(std::shared_ptr<RedRtpPacket> packet);
+	// Queue media for FEC without Encode — EncodePending() runs XOR later so
+	// the media path is not blocked on the marker packet.
+	bool AddMediaPacket(std::shared_ptr<RedRtpPacket> packet);
+	// Take ownership of already-copied packets (no further copy).
+	void AdoptMediaPackets(std::vector<std::shared_ptr<RedRtpPacket>> &&packets);
+	bool EncodePending();
+	// Move queued media out for async Encode on another thread.
+	std::vector<std::shared_ptr<RedRtpPacket>> StealMediaPackets();
 	bool IsAvailableFecPackets() const;
 	bool NextPacket(RtpPacket *packet);
 
