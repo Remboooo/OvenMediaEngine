@@ -948,7 +948,8 @@ bool RtcSession::ProcessNACK(const std::shared_ptr<RtcpInfo> &rtcp_info)
 		return false;
 	}
 
-	// Retransmission
+	// Retransmission — do not return after the first hit (old bug left the rest
+	// of the NACK list unretransmitted).
 	for (size_t i = 0; i < nack->GetLostIdCount(); i++)
 	{
 		auto seq_no	  = nack->GetLostId(i);
@@ -961,13 +962,15 @@ bool RtcSession::ProcessNACK(const std::shared_ptr<RtcpInfo> &rtcp_info)
 		logtt("RTX requested(%d) - TrackID(%u) PayloadType(%d) OriginSeqNo(%u)", seq_no, sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
 
 		auto rtx_packet = stream->GetRtxRtpPacket(sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
-		if (rtx_packet != nullptr)
+		if (rtx_packet == nullptr)
 		{
-			auto copy_rtx_packet = std::make_shared<RtxRtpPacket>(*rtx_packet);
-			copy_rtx_packet->SetSequenceNumber(_rtx_sequence_number++);
-			copy_rtx_packet->SetOriginalSequenceNumber(sent_log->_sequence_number);
-			return _rtp_rtcp->SendRtpPacket(copy_rtx_packet);
+			continue;
 		}
+
+		auto copy_rtx_packet = std::make_shared<RtxRtpPacket>(*rtx_packet);
+		copy_rtx_packet->SetSequenceNumber(_rtx_sequence_number++);
+		copy_rtx_packet->SetOriginalSequenceNumber(sent_log->_sequence_number);
+		_rtp_rtcp->SendRtpPacket(copy_rtx_packet);
 	}
 
 	return true;
