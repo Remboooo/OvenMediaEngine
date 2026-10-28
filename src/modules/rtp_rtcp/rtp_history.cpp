@@ -13,9 +13,18 @@ RtpHistory::RtpHistory(uint8_t origin_payload_type, uint8_t rtx_payload_type, ui
 // Converting to RtxRtpPacket
 bool RtpHistory::StoreRtpPacket(const std::shared_ptr<RtpPacket> &packet)
 {
-	std::lock_guard<std::shared_mutex> guard(_history_lock);
+	auto index = GetIndex(packet->SequenceNumber());
+	{
+		std::lock_guard<std::shared_mutex> guard(_history_lock);
+		_history[index] = packet;
+	}
 
-	_history[GetIndex(packet->SequenceNumber())] = packet;
+	// The cached RTX packet for this slot was made from the packet just replaced. Its original
+	// sequence number matches again after the 16-bit sequence wraps (every 65536 packets, a few
+	// minutes of video), and a NACK then got that minutes-old payload, which the session sends
+	// under the NACKed sequence number: the receiver assembles a broken frame and waits for a keyframe.
+	std::lock_guard<std::shared_mutex> cache_guard(_history_cache_lock);
+	_history_cache.erase(index);
 
 	return true;
 }

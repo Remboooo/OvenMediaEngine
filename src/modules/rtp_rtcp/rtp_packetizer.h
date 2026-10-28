@@ -3,6 +3,7 @@
 #include "rtp_packet.h"
 #include "rtp_packetizing_manager.h"
 #include "rtp_rtcp_defines.h"
+#include "ulpfec_encode_worker.h"
 #include "ulpfec_generator.h"
 
 #include "base/mediarouter/media_buffer.h"
@@ -65,6 +66,8 @@ private:
 	                    const RTPVideoHeader *video_header);
 
 	bool GenerateRedAndFecPackets(std::shared_ptr<RtpPacket> packet);
+	// Emit parity the Encode worker has finished. Packetize thread only.
+	void EmitReadyFec();
 
 	// Audio Pakcet Sender Interface
 	bool PacketizeAudio(FrameType frame_type,
@@ -82,7 +85,7 @@ private:
 	uint32_t _ssrc;
 	uint8_t _payload_type;
 	std::vector<uint32_t> _csrcs;
-	// Sequence Number (shared_ptr so async FEC workers outlive briefly).
+	// Sequence Number. Assigned on the packetize thread only (media, RED and FEC).
 	struct SequenceState
 	{
 		std::mutex mutex;
@@ -97,6 +100,10 @@ private:
 	uint8_t _ulpfec_payload_type;
 
 	UlpfecGenerator _ulpfec_generator;
+	// Created on the first protected frame; joined on destruction.
+	std::unique_ptr<UlpfecEncodeWorker> _ulpfec_worker;
+	// How long the packetize thread waits for a frame's parity before leaving it to the next frame
+	static constexpr std::chrono::microseconds kFecEmitWait{3000};
 
 	cmn::MediaCodecId		_video_codec_type;
 	cmn::MediaCodecId		_audio_codec_type;

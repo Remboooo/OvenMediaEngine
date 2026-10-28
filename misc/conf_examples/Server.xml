@@ -529,6 +529,9 @@
 							<Rtx>false</Rtx>
 							<Ulpfec>false</Ulpfec>
 							<JitterBuffer>false</JitterBuffer>
+							<!-- Opt-in, see docs/streaming/webrtc-publishing.md -->
+							<SendPacing>false</SendPacing>
+							<VideoShedding>false</VideoShedding>
 							<CreateDefaultPlaylist>true</CreateDefaultPlaylist>
 						</WebRTC>
 						<LLHLS>

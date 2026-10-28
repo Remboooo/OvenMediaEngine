@@ -752,6 +752,9 @@ Finally, `Server.xml` is configured as follows:
                             <Rtx>false</Rtx>
                             <Ulpfec>false</Ulpfec>
                             <JitterBuffer>false</JitterBuffer>
+                            <!-- Opt-in, see docs/streaming/webrtc-publishing.md -->
+                            <SendPacing>false</SendPacing>
+                            <VideoShedding>false</VideoShedding>
                         </WebRTC>
                         <LLHLS>
                             <ChunkDuration>0.2</ChunkDuration>

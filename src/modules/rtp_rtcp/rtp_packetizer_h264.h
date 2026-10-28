@@ -61,6 +61,12 @@ public:
 
 	bool NextPacket(RtpPacket* rtp_packet) override;
 
+	// NAL units a WebRTC receiver does not use: access unit delimiters, and SEI that carries only HRD
+	// timing (buffering period, picture timing). An encoder puts them in front of every frame, where they
+	// take an RTP packet of their own (a slice never fits beside them); libwebrtc drops AUD on receipt.
+	// Other SEI (captions, user data) is kept.
+	static bool IsDispensableNalUnit(const uint8_t* nal, size_t length);
+
 private:
 	struct Fragment 
 	{

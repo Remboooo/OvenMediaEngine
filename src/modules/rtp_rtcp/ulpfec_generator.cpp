@@ -12,6 +12,20 @@ constexpr size_t	kUlpfecMaxMediaPacketsLbitClear	= 16;
 
 constexpr size_t    kMediaPacketNumMakeFec          = 7; 
 
+// RFC 5109 protects everything after the fixed 12-byte RTP header: CSRCs, header extensions and
+// payload (libwebrtc's ForwardErrorCorrection XORs data[12..] and recovers that many bytes). The
+// media packets here are RED-packaged but not yet finalized (PackageAsRtp), so their RED header
+// sits between the extensions and Payload(); it is not part of the protected media packet.
+static size_t ProtectedHeaderLength(const RedRtpPacket &packet)
+{
+	return packet.HeadersSize() - RED_HEADER_SIZE - FIXED_HEADER_SIZE;
+}
+
+static size_t ProtectedLength(const RedRtpPacket &packet)
+{
+	return ProtectedHeaderLength(packet) + packet.PayloadSize();
+}
+
 UlpfecGenerator::UlpfecGenerator()
 {
 	_high_level = false;
@@ -126,7 +140,17 @@ bool UlpfecGenerator::Encode()
 		{
 			auto media_packet = _media_packets[media_packet_idx];
 
-			size_t fec_packet_length = fec_header_size + media_packet->PayloadSize();
+			// The mask covers mask_len*8 sequence numbers from sn_base. If the
+			// group is not contiguous (FEC interleaved into it), leave the packet
+			// unprotected rather than writing past mask[] or protecting the wrong set.
+			if(first_media_packet == false &&
+			   static_cast<uint16_t>(media_packet->SequenceNumber() - sn_base) >= mask_len * 8)
+			{
+				media_packet_idx++;
+				continue;
+			}
+
+			size_t fec_packet_length = fec_header_size + ProtectedLength(*media_packet);
 
 			if(fec_packet->GetLength() < fec_packet_length)
 			{
@@ -158,9 +182,11 @@ bool UlpfecGenerator::Encode()
 				// Write timestamp recovery field.
 				ByteWriter<uint32_t>::WriteBigEndian(&fec_buffer[4], media_packet->Timestamp());
 				// Write length recovery field.
-				ByteWriter<uint16_t>::WriteBigEndian(&fec_buffer[8], (uint16_t)media_packet->PayloadSize());
-				// Write Payload.
-				memcpy(&fec_buffer[fec_header_size], media_packet->Payload(), media_packet->PayloadSize());
+				ByteWriter<uint16_t>::WriteBigEndian(&fec_buffer[8], (uint16_t)ProtectedLength(*media_packet));
+				// Write the protected bytes: CSRCs and extensions, then the payload.
+				const auto header_length = ProtectedHeaderLength(*media_packet);
+				memcpy(&fec_buffer[fec_header_size], media_packet->Buffer() + FIXED_HEADER_SIZE, header_length);
+				memcpy(&fec_buffer[fec_header_size + header_length], media_packet->Payload(), media_packet->PayloadSize());
 
 				sn_base = media_packet->SequenceNumber();
 
@@ -192,6 +218,7 @@ void UlpfecGenerator::XorFecPacket(uint8_t *fec_packet, size_t fec_header_len, R
 	auto rtp_header_len = media_packet->HeadersSize();
 	auto rtp_payload = media_packet->Payload();
 	auto rtp_payload_len = media_packet->PayloadSize();
+	auto protected_header_len = ProtectedHeaderLength(*media_packet);
 
 	// XOR the first 2 bytes of the header: V, P, X, CC
 	fec_packet[0] ^= rtp_header[0];
@@ -215,14 +242,18 @@ void UlpfecGenerator::XorFecPacket(uint8_t *fec_packet, size_t fec_header_len, R
 
 	// XOR Length recovery
 	uint8_t rtp_payload_length_network_order[2];
-	ByteWriter<uint16_t>::WriteBigEndian(rtp_payload_length_network_order, (uint16_t)rtp_payload_len);
+	ByteWriter<uint16_t>::WriteBigEndian(rtp_payload_length_network_order, (uint16_t)ProtectedLength(*media_packet));
 	fec_packet[8] ^= rtp_payload_length_network_order[0];
 	fec_packet[9] ^= rtp_payload_length_network_order[1];
 
-	// XOR Payload
+	// XOR the protected bytes: CSRCs and extensions, then the payload
+	for(size_t i = 0; i < protected_header_len; i++)
+	{
+		fec_packet[fec_header_len + i] ^= rtp_header[FIXED_HEADER_SIZE + i];
+	}
 	for(size_t i = 0; i < rtp_payload_len; i++)
 	{
-		fec_packet[fec_header_len + i] ^= rtp_payload[i];
+		fec_packet[fec_header_len + protected_header_len + i] ^= rtp_payload[i];
 	}
 }
 

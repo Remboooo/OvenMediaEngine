@@ -26,16 +26,11 @@
 using namespace cmn;
 
 // <JitterBuffer>true</JitterBuffer> (see docs/streaming/webrtc-publishing.md)
-// enables a sender-side smoothing hold so bursty ingress is released evenly.
-// Min is a fixed floor (80ms). Max was previously pinned to Min because under
-// simultaneous 4K Bypass+ULPFEC + ladder rungs, AdaptiveDelay step-ups opened
-// ≥200ms decode gaps (Chrome freezeEvents with packetsLost=0). With hold-from-
-// arrival pacing + async FEC, Min=80/Max=500 passed the all3 soak (freezeCount=0)
-// so the controller can absorb burstier ingress within the ≤500ms extra E2E
-// latency budget. Packetize always runs on DelayQueue workers regardless of
-// this flag (see PaceGroup).
-static constexpr int kPacerMinMs = 80;
-static constexpr int kPacerMaxMs = 500;
+// enables a sender-side smoothing hold so bursty ingress is released evenly,
+// within <JitterBufferDelay> (default 20:500 ms, as upstream). Min=80/Max=500
+// passed the all3 soak (simultaneous 4K Bypass+ULPFEC + ladder rungs,
+// freezeCount=0) with hold-from-arrival pacing + async FEC. Packetize always
+// runs on DelayQueue workers regardless of this flag (see PaceGroup).
 
 /***************************
  SDP Sample
@@ -156,12 +151,17 @@ bool RtcStream::Start()
 	auto playoutDelay  = webrtc_config.GetPlayoutDelay(&_playout_delay_enabled);
 	_playout_delay_min = playoutDelay.GetMin();
 	_playout_delay_max = playoutDelay.GetMax();
+	_adaptive_playout_delay_enabled = _playout_delay_enabled && playoutDelay.IsAdaptive();
+	_send_pacing_enabled			= webrtc_config.IsSendPacingEnabled();
+	_video_shedding_enabled			= webrtc_config.IsVideoSheddingEnabled();
 
 	// JitterBuffer = AdaptiveDelay hold. Packetize is always offloaded onto
 	// per-rung DelayQueues so a demanded 4K passthrough is not serialized
 	// with concurrent transcoded rungs on the media thread (JB=false used
 	// to Packetize inline and the passthrough froze first).
 	_jitter_buffer_enabled = webrtc_config.IsJitterBufferEnabled();
+	_jitter_buffer_min_ms  = webrtc_config.GetJitterBufferDelay().GetMin();
+	_jitter_buffer_max_ms  = webrtc_config.GetJitterBufferDelay().GetMax();
 	// Diagnostic A/B: OME_WEBRTC_DISABLE_JITTERBUFFER=1 keeps DelayQueue
 	// packetize offload but sets AdaptiveDelay hold to 0.
 	if (const char *disable_jb = std::getenv("OME_WEBRTC_DISABLE_JITTERBUFFER");
@@ -291,7 +291,7 @@ bool RtcStream::Start()
 		auto stream_label	= ov::String::FormatString("%s/%s", GetApplication()->GetVHostAppName().CStr(), GetName().CStr());
 
 		std::weak_ptr<pub::Stream> stream_weak = pub::Stream::GetSharedPtrAs<pub::Stream>();
-		const uint32_t pacer_delay_ms		   = _jitter_buffer_enabled ? static_cast<uint32_t>(kPacerMinMs) : 0;
+		const uint32_t pacer_delay_ms		   = _jitter_buffer_enabled ? static_cast<uint32_t>(_jitter_buffer_min_ms) : 0;
 
 		for (const auto &track : paced_tracks)
 		{
@@ -314,7 +314,7 @@ bool RtcStream::Start()
 				{
 					group->adaptive = std::make_shared<AdaptiveDelayController>(
 						ov::String::FormatString("%s#g%u", stream_label.CStr(), group_id),
-						kPacerMinMs, kPacerMaxMs);
+						_jitter_buffer_min_ms, _jitter_buffer_max_ms);
 				}
 				// Packetize off the DelayQueue thread: RED/ULPFEC on 4K keyframes
 				// otherwise HOL-stalls every subsequently-due frame in the group
@@ -423,14 +423,18 @@ bool RtcStream::Start()
 		}
 	}
 
-	logti("WebRTC Stream has been created : %s/%u\nRtx(%s) Ulpfec(%s) PlayoutDelay(%s min:%d max:%d) JitterBuffer(%s) AsyncPacketize(%s)",
+	logti("WebRTC Stream has been created : %s/%u\nRtx(%s) Ulpfec(%s) PlayoutDelay(%s min:%d max:%d adaptive:%s) JitterBuffer(%s %d:%d ms) AsyncPacketize(%s) SendPacing(%s) VideoShedding(%s)",
 		  GetName().CStr(), GetId(),
 		  ov::Converter::ToString(_rtx_enabled).CStr(),
 		  ov::Converter::ToString(_ulpfec_enabled).CStr(),
 		  ov::Converter::ToString(_playout_delay_enabled).CStr(),
 		  _playout_delay_min, _playout_delay_max,
+		  ov::Converter::ToString(_adaptive_playout_delay_enabled).CStr(),
 		  ov::Converter::ToString(_jitter_buffer_enabled).CStr(),
-		  ov::Converter::ToString(_pacer_enabled).CStr());
+		  _jitter_buffer_min_ms, _jitter_buffer_max_ms,
+		  ov::Converter::ToString(_pacer_enabled).CStr(),
+		  ov::Converter::ToString(_send_pacing_enabled).CStr(),
+		  ov::Converter::ToString(_video_shedding_enabled).CStr());
 
 	return Stream::Start();
 }
@@ -946,9 +950,11 @@ bool RtcStream::OnRtpPacketized(std::shared_ptr<RtpPacket> packet)
 		session->SendOutgoingData(stream_packet);
 	}
 
-	// Skip ULPFEC parity in RTX history — not useful for NACK recovery, and
-	// leaving them unshared lets ProcessOutgoingRtp SRTP in place (use_count==1).
-	if (target_sessions.empty() == false && _rtx_enabled == true && packet->IsUlpfec() == false)
+	// ULPFEC parity must be retransmittable too. With RED it takes media
+	// sequence numbers between frames, the receiver cannot tell a lost FEC
+	// packet from lost media and NACKs it, and libwebrtc's H.264 packet buffer
+	// holds every delta frame behind an unfilled gap until the next keyframe.
+	if (target_sessions.empty() == false && _rtx_enabled == true)
 	{
 		auto history = GetHistory(packet->GetTrackId(), packet->PayloadType());
 		if (history != nullptr)
@@ -1072,6 +1078,36 @@ void RtcStream::LogDemandedTracksUnlocked() const
 		  keyframe_only.IsEmpty() ? "-" : keyframe_only.CStr());
 }
 
+bool RtcStream::PassesDemandFilter(uint32_t track_id, bool is_keyframe, std::chrono::steady_clock::time_point now)
+{
+	const bool fully_demanded = IsTrackFullyDemanded(track_id);
+
+	std::lock_guard<std::mutex> lock(_pending_rung_lock);
+	if (fully_demanded)
+	{
+		_pending_rung_keyframe_at.erase(track_id);
+		return true;
+	}
+
+	if (is_keyframe)
+	{
+		_pending_rung_keyframe_at[track_id] = now;
+		return true;
+	}
+
+	auto it = _pending_rung_keyframe_at.find(track_id);
+	if (it == _pending_rung_keyframe_at.end())
+	{
+		return false;
+	}
+	if (now - it->second <= kPendingRungHold)
+	{
+		return true;
+	}
+	_pending_rung_keyframe_at.erase(it);
+	return false;
+}
+
 void RtcStream::SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet)
 {
 	// Capture arrival time at the very top so that any subsequent processing
@@ -1102,7 +1138,7 @@ void RtcStream::SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet)
 	// Pending ABR target: only keyframes are selectable until ChangeRendition.
 	// Packetizing the whole next rung (e.g. after AutoAbr OverUse with 2
 	// viewers) recreates the multi-rung stall we just removed.
-	if (IsTrackFullyDemanded(track_id) == false && media_packet->IsKeyFrame() == false)
+	if (PassesDemandFilter(track_id, media_packet->IsKeyFrame(), arrival_time) == false)
 	{
 		return;
 	}
@@ -1236,6 +1272,26 @@ void RtcStream::PacketizeVideoFrame(const std::shared_ptr<MediaPacket> &media_pa
 			 codec_info.codec_type == MediaCodecId::H265)
 	{
 		codec_info.codec_specific.h26X = CodecSpecificInfoH26X();
+	}
+
+	if (codec_info.codec_type == MediaCodecId::H264)
+	{
+		bool warn = false;
+		{
+			std::lock_guard<std::mutex> lock(_bframe_check_lock);
+			auto last = _last_video_pts.find(media_track->GetId());
+			if (last != _last_video_pts.end() && media_packet->GetPts() < last->second &&
+				_bframe_warned_tracks.insert(media_track->GetId()).second)
+			{
+				warn = true;
+			}
+			_last_video_pts[media_track->GetId()] = media_packet->GetPts();
+		}
+		if (warn)
+		{
+			logtw("RtcStream(%s/%s) - Video track %u has B-frames. Chrome cannot decode them in software: a viewer without H.264 hardware decoding, or one whose hardware decoder hits any error, plays keyframes only until it reloads. Encode without B-frames (bframes=0) or play a transcoded rendition.",
+				  GetApplication()->GetVHostAppName().CStr(), GetName().CStr(), media_track->GetId());
+		}
 	}
 
 	memset(&rtp_video_header, 0, sizeof(RTPVideoHeader));

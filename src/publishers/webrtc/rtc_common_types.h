@@ -10,7 +10,11 @@
 
 #include <base/common_types.h>
 
-#define MAX_RTP_RECORDS 1500
+// Sent-log / RTX history depth in packets. Must cover Chrome's NACK retry
+// window at the highest packet rate: 4K60 RED+ULPFEC is ~7000 pps, and the old
+// 1500 (~210ms) let late NACKs land on overwritten slots, so the hole was never
+// repaired. A power of two keeps seq % N continuous across the 16-bit wrap.
+#define MAX_RTP_RECORDS 8192
 
 // https://tools.ietf.org/html/rfc5761#section-4
 // - payload type values in the range 64-95 MUST NOT be used

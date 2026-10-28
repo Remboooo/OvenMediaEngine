@@ -8,8 +8,13 @@
 //==============================================================================
 #include "rtc_session.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <optional>
+
+// In a RED-wrapped ULPFEC payload: [RED header (1)][E L P X CC (1)][M PT (1)][SN base (2)]...
+static constexpr size_t kFecSnBaseOffset = 3;
 #include <thread>
 #include <utility>
 
@@ -174,10 +179,27 @@ bool RtcSession::Start()
 			}
 
 			_video_transport_cc_enabled = media_transport_cc_enabled;
+
+			auto rtc_stream = std::static_pointer_cast<RtcStream>(GetStream());
+			// <PlayoutDelay><Adaptive>: this session sets its own delay (see UpdateAdaptivePlayoutDelay)
+			if (rtc_stream->IsAdaptivePlayoutDelayEnabled() && peer_media_desc->GetExtmapItem(RTP_HEADER_EXTENSION_PLAYOUT_DELAY_ID).IsEmpty() == false)
+			{
+				_playout_delay_negotiated = true;
+				_config_playout_min_ms	  = rtc_stream->GetPlayoutDelayMin();
+				_config_playout_max_ms	  = rtc_stream->GetPlayoutDelayMax();
+				_playout_min_ms			  = _config_playout_min_ms;
+				_playout_max_ms			  = _config_playout_max_ms;
+			}
 		}
 
 		transport_cc_enabled = transport_cc_enabled || media_transport_cc_enabled;
 		remb_enabled = remb_enabled || media_remb_enabled;
+	}
+
+	{
+		auto rtc_stream			= std::static_pointer_cast<RtcStream>(GetStream());
+		_send_pacing_enabled	= rtc_stream->IsSendPacingEnabled();
+		_video_shedding_enabled = rtc_stream->IsVideoSheddingEnabled();
 	}
 
 	// Init bandwidth estimator
@@ -295,16 +317,41 @@ void RtcSession::FinishKeyframeDrain(const char *reason)
 	const double copy_ms = static_cast<double>(_kf_drain_copy_ns) / 1.0e6;
 	const double send_ms = static_cast<double>(_kf_drain_send_ns) / 1.0e6;
 
-	// Log drains that can produce a visible freeze (~2 frames @ 60fps) or deep queue.
-	if (drain_ms >= 50 || _kf_drain_packets >= 150 || _kf_drain_q_start >= 64 ||
-		_send_queue.Size() >= 64)
+	// Every drain at debug level. A large keyframe alone is normal (a 1080p/4K one is 150-300 packets, and
+	// <SendPacing> spreads it on purpose); warn only when the send itself stalled: a packet waited long enough
+	// to show as a freeze, or the queue is still deep after the keyframe. At most once per 10 s per session.
+	const bool stalled = drain_ms >= 100 || _kf_drain_max_age_ms >= 100 || _send_queue.Size() >= 64;
+	if (stalled)
 	{
-		logtw("RtcKfDrain session=%u reason=%s pkts=%u fec=%u bytes=%" PRIu64
-			  " drain_ms=%lld q0=%zu max_age_ms=%lld copy_ms=%.1f send_ms=%.1f queue_now=%zu",
-			  GetId(), reason, _kf_drain_packets, _kf_drain_fec_packets, _kf_drain_bytes,
-			  static_cast<long long>(drain_ms), _kf_drain_q_start,
-			  static_cast<long long>(_kf_drain_max_age_ms), copy_ms, send_ms, _send_queue.Size());
+		_kf_drain_stalls++;
 	}
+	const auto now = std::chrono::steady_clock::now();
+	const bool warn = stalled && now - _kf_drain_warned_at >= std::chrono::seconds(10);
+	if (warn || ov_log_get_enabled(OV_LOG_TAG, OVLogLevelDebug))
+	{
+		const auto line = ov::String::FormatString(
+			"RtcKfDrain session=%u reason=%s pkts=%u fec=%u bytes=%" PRIu64
+			" drain_ms=%lld q0=%zu max_age_ms=%lld copy_ms=%.1f send_ms=%.1f queue_now=%zu stalls=%u",
+			GetId(), reason, _kf_drain_packets, _kf_drain_fec_packets, _kf_drain_bytes,
+			static_cast<long long>(drain_ms), _kf_drain_q_start,
+			static_cast<long long>(_kf_drain_max_age_ms), copy_ms, send_ms, _send_queue.Size(), _kf_drain_stalls);
+		if (warn)
+		{
+			logtw("%s", line.CStr());
+		}
+		else
+		{
+			logtd("%s", line.CStr());
+		}
+	}
+	if (warn)
+	{
+		_kf_drain_warned_at = now;
+		_kf_drain_stalls = 0;
+	}
+
+	// The largest keyframe (with its parity): what this session already sends at once
+	_pacing_burst_bytes = std::max({_pacing_burst_bytes.load(), kMinPacingBurstBytes, _kf_drain_bytes});
 
 	_kf_drain_active = false;
 	_kf_drain_seen_marker = false;
@@ -314,8 +361,10 @@ void RtcSession::SendThreadProc()
 {
 	ov::logger::ThreadHelper thread_helper;
 
-	// Drain as fast as the kernel accepts. App-level bitrate caps were tried and
-	// caused silent freezes (RTP seq is assigned here, so queue delay ≠ packetsLost).
+	// Drain as fast as the kernel accepts, up to the largest keyframe at once (PaceSend), retransmissions
+	// first. App-level
+	// bitrate caps were tried and caused silent freezes (RTP seq is assigned here, so queue delay ≠
+	// packetsLost): PaceSend never holds back a burst the session already sends at its keyframes.
 	// Kernel SO_SNDBUF + sendmsg EAGAIN retry absorb keyframe microbursts.
 	auto last_log = std::chrono::steady_clock::now();
 
@@ -329,6 +378,12 @@ void RtcSession::SendThreadProc()
 				FinishKeyframeDrain("queue_stop");
 			}
 			break;
+		}
+
+		SendQueuedRtx();
+		if (packet.value() == nullptr)
+		{
+			continue;  // woken for retransmissions only
 		}
 
 		ProcessOutgoingRtp(packet.value());
@@ -839,6 +894,11 @@ void RtcSession::ProcessOutgoingRtp(const std::shared_ptr<RtpPacket> &session_pa
 	const bool is_fec = session_packet->IsUlpfec();
 	const bool is_key_media = is_video && session_packet->IsKeyframe() && (is_fec == false);
 
+	if (is_video && ShedVideo(session_packet, is_fec, is_key_media))
+	{
+		return;
+	}
+
 	// Start/extend keyframe drain window (media + trailing FEC of same timestamp).
 	if (is_key_media && session_packet->IsFirstPacketOfFrame())
 	{
@@ -894,17 +954,51 @@ void RtcSession::ProcessOutgoingRtp(const std::shared_ptr<RtpPacket> &session_pa
 
 	auto &media_rtp_sequence_number = send_packet->IsVideoPacket() ? _video_rtp_sequence_number : _audio_rtp_sequence_number;
 	const uint16_t origin_sequence_number = session_packet->SequenceNumber();
+	if (is_video && is_fec && RemapFecSnBase(*send_packet, origin_sequence_number, media_rtp_sequence_number) == false)
+	{
+		// Its protected packets are not where its mask says in this session's numbering: a receiver
+		// would recover the wrong packet. Not sent, so it takes no sequence number either.
+		return;
+	}
+	if (is_video)
+	{
+		_video_sequence_map[origin_sequence_number % kSequenceMapSize] = {origin_sequence_number, media_rtp_sequence_number, true};
+	}
+	if (is_key_media && session_packet->IsFirstPacketOfFrame())
+	{
+		_newest_keyframe_sequence_number = media_rtp_sequence_number;
+		_newest_keyframe_sent_ms		 = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		_has_sent_keyframe				 = true;
+	}
 	send_packet->SetSequenceNumber(media_rtp_sequence_number++);
+
+	PaceSend(send_packet->GetDataLength(), true);
 
 	// Set transport-wide sequence number
 	bool media_transport_cc_enabled = send_packet->IsVideoPacket() ? _video_transport_cc_enabled : _audio_transport_cc_enabled;
 
+	// Only a packet that carries the extension takes a transport-wide number. ULPFEC parity has no
+	// header extensions: numbering it anyway left a gap per parity packet, which the receiver's
+	// feedback reports as lost, so the estimator saw 5-20% loss on a clean path and auto ABR fell to
+	// the lowest rung and stayed there.
 	if (media_transport_cc_enabled)
 	{
-		SetTransportWideSequenceNumber(send_packet, _wide_sequence_number);
+		media_transport_cc_enabled = SetTransportWideSequenceNumber(send_packet, _wide_sequence_number);
 	}
 
 	SetAbsSendTime(send_packet, ov::Clock::NowMSec());
+	if (_playout_delay_negotiated && is_video && _playout_min_ms != _config_playout_min_ms)
+	{
+		// The path stopped losing: back towards the configured delay, slowly enough for the receiver's
+		// audio sync to follow
+		const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		if (now_ms - _last_nack_ms > kAdaptivePlayoutQuietMs && now_ms - _last_playout_step_ms >= kAdaptivePlayoutStepIntervalMs)
+		{
+			_last_playout_step_ms = now_ms;
+			SetAdaptivePlayoutMin(_playout_min_ms - kAdaptivePlayoutStepMs, 0);
+		}
+		SetPlayoutDelay(send_packet, _playout_min_ms, _playout_max_ms);
+	}
 
 	const auto t_send0 = std::chrono::steady_clock::now();
 	// rtp_rtcp -> srtp -> dtls -> Edge Node(RtcSession)
@@ -983,6 +1077,84 @@ bool RtcSession::SetTransportWideSequenceNumber(const std::shared_ptr<RtpPacket>
 	return true;
 }
 
+void RtcSession::UpdateAdaptivePlayoutDelay()
+{
+	const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	_last_nack_ms = now_ms;
+	_nack_times.push_back(now_ms);
+	while (now_ms - _nack_times.front() > kAdaptivePlayoutWindowMs)
+	{
+		_nack_times.pop_front();
+	}
+
+	// Sustained loss: NACKs in enough different seconds of the window. One outage or burst NACKs a
+	// lot at once, and needs no deeper buffer afterwards.
+	size_t seconds = 0;
+	int64_t last_second = -1;
+	for (const auto at_ms : _nack_times)
+	{
+		if (at_ms / 1000 != last_second)
+		{
+			last_second = at_ms / 1000;
+			seconds++;
+		}
+	}
+	const bool raised = _playout_min_ms != _config_playout_min_ms;
+	if ((raised == false && seconds < kAdaptivePlayoutMinNackSeconds) || _bandwidth_estimator == nullptr)
+	{
+		return;
+	}
+
+	// A repair arrives about an RTT after the loss. The path's own RTT, not the NACKs' delay: that
+	// includes whatever queue or outage caused the loss (a 1 s outage read as a 1 s repair time).
+	const int64_t repair_ms = _bandwidth_estimator->GetBaseRttMs();
+	if (repair_ms <= kAdaptivePlayoutMinRepairMs)
+	{
+		return;	 // within what the receiver buffers anyway
+	}
+	const int min_ms = std::clamp(static_cast<int>(repair_ms) + kAdaptivePlayoutMarginMs, _config_playout_min_ms, std::max(_config_playout_min_ms, kAdaptivePlayoutCapMs));
+	SetAdaptivePlayoutMin(min_ms, _nack_times.size());
+}
+
+void RtcSession::SetAdaptivePlayoutMin(int min_ms, size_t nacks)
+{
+	// 10 ms granularity on the wire. Raised in one go (the viewer freezes until then); lowered only by
+	// the send thread's steps (nacks == 0). Small raises are not worth a change in the receiver's target.
+	min_ms = std::max(_config_playout_min_ms, (min_ms + 9) / 10 * 10);
+	if (nacks > 0 && min_ms < _playout_min_ms + 20)
+	{
+		return;
+	}
+	const int max_ms = (min_ms == _config_playout_min_ms) ? _config_playout_max_ms : std::max(_config_playout_max_ms, min_ms + kAdaptivePlayoutMaxHeadroomMs);
+	if (min_ms == _playout_min_ms && max_ms == _playout_max_ms)
+	{
+		return;
+	}
+	if (nacks > 0 || min_ms == _config_playout_min_ms)
+	{
+		logtd("RtcPlayoutDelay session=%u %d:%d ms -> %d:%d ms (%zu NACKs in %" PRId64 " ms)", GetId(), _playout_min_ms.load(), _playout_max_ms.load(), min_ms, max_ms, nacks, kAdaptivePlayoutWindowMs);
+	}
+	_playout_max_ms = max_ms;
+	_playout_min_ms = min_ms;
+}
+
+bool RtcSession::SetPlayoutDelay(const std::shared_ptr<RtpPacket> &rtp_packet, int min_ms, int max_ms)
+{
+	auto extension_buffer = rtp_packet->Extension(RTP_HEADER_EXTENSION_PLAYOUT_DELAY_ID);
+	if (extension_buffer == nullptr)
+	{
+		return false;
+	}
+
+	auto payload_offset = rtp_packet->GetExtensionType() == RtpHeaderExtension::HeaderType::ONE_BYTE_HEADER ? 1 : 2;
+
+	// 12 bits each, in 10 ms units
+	const uint32_t value = (static_cast<uint32_t>(std::min(min_ms / 10, 0xFFF)) << 12) | static_cast<uint32_t>(std::min(max_ms / 10, 0xFFF));
+	ByteWriter<uint24_t>::WriteBigEndian(extension_buffer + payload_offset, value);
+
+	return true;
+}
+
 bool RtcSession::SetAbsSendTime(const std::shared_ptr<RtpPacket> &rtp_packet, uint64_t time_ms)
 {
 	auto extension_buffer = rtp_packet->Extension(RTP_HEADER_EXTENSION_ABS_SEND_TIME_ID);
@@ -1014,6 +1186,7 @@ bool RtcSession::RecordRtpSent(const std::shared_ptr<const RtpPacket> &rtp_packe
 	sent_log->_origin_sequence_number = origin_sequence_number;
 	sent_log->_timestamp = rtp_packet->Timestamp();
 	sent_log->_marker = rtp_packet->Marker();
+	sent_log->_is_fec = rtp_packet->IsUlpfec();
 	sent_log->_ssrc = rtp_packet->Ssrc();
 
 	sent_log->_sent_bytes = rtp_packet->GetDataLength();
@@ -1026,6 +1199,8 @@ bool RtcSession::RecordRtpSent(const std::shared_ptr<const RtpPacket> &rtp_packe
 	if (rtp_packet->IsVideoPacket())
 	{
 		_video_rtp_sent_record_map[video_rtp_key] = sent_log;
+		_newest_video_sent_sequence_number = sent_log->_sequence_number;
+		_has_sent_video_record = true;
 	}
 
 	return true;
@@ -1038,6 +1213,15 @@ std::shared_ptr<RtcSession::RtpSentLog> RtcSession::TraceRtpSentByVideoSeqNo(uin
 	auto key = sequence_number % MAX_RTP_RECORDS;
 	auto it	 = _video_rtp_sent_record_map.find(key);
 	if (it == _video_rtp_sent_record_map.end())
+	{
+		return nullptr;
+	}
+
+	// The slot is a ring: a NACK older than MAX_RTP_RECORDS packets finds a
+	// newer packet here. Retransmitting that one never fills the receiver's
+	// hole (it re-NACKs until its packet buffer overflows and it drops to the
+	// next keyframe), so treat it as not found.
+	if (it->second->_sequence_number != sequence_number)
 	{
 		return nullptr;
 	}
@@ -1120,18 +1304,354 @@ bool RtcSession::ProcessNACK(const std::shared_ptr<RtcpInfo> &rtcp_info)
 		return false;
 	}
 
+	// Oldest packet of this NACK that was retransmitted
+	std::optional<uint16_t> oldest_repaired;
+
 	// Retransmission — do not return after the first hit (old bug left the rest
 	// of the NACK list unretransmitted).
 	for (size_t i = 0; i < nack->GetLostIdCount(); i++)
 	{
 		auto seq_no	  = nack->GetLostId(i);
 		auto sent_log = TraceRtpSentByVideoSeqNo(seq_no);
+		static const bool debug_rtx = std::getenv("OME_DEBUG_RTX") != nullptr;
 		if (sent_log == nullptr)
 		{
+			if (debug_rtx)
+			{
+				logtw("RtxDebug session=%u nack_seq=%u miss=sent_log next_video_seq=%u", GetId(), seq_no, _video_rtp_sequence_number);
+			}
 			continue;
 		}
 
 		logtt("RTX requested(%d) - TrackID(%u) PayloadType(%d) OriginSeqNo(%u)", seq_no, sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
+
+		if (_playout_delay_negotiated)
+		{
+			UpdateAdaptivePlayoutDelay();
+		}
+
+		auto rtx_packet = stream->GetRtxRtpPacket(sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
+		if (rtx_packet != nullptr && RtxWanted(seq_no, rtx_packet->GetDataLength()) == false)
+		{
+			if (debug_rtx)
+			{
+				logtw("RtxDebug session=%u nack_seq=%u skipped (budget or superseded by a keyframe)", GetId(), seq_no);
+			}
+			continue;
+		}
+		if (rtx_packet == nullptr)
+		{
+			if (debug_rtx)
+			{
+				logtw("RtxDebug session=%u nack_seq=%u miss=history track=%u pt=%u origin_seq=%u fec=%d", GetId(), seq_no,
+					  sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number, sent_log->_is_fec ? 1 : 0);
+			}
+			continue;
+		}
+
+		auto copy_rtx_packet = std::make_shared<RtxRtpPacket>(*rtx_packet);
+		copy_rtx_packet->SetSequenceNumber(_rtx_sequence_number++);
+		copy_rtx_packet->SetOriginalSequenceNumber(sent_log->_sequence_number);
+		if (sent_log->_is_fec)
+		{
+			// The history holds the parity as the stream numbered it; move its SN base the way the
+			// original send did (same offset: RemapFecSnBase only sends parity with a constant one)
+			const uint16_t offset = sent_log->_sequence_number - sent_log->_origin_sequence_number;
+			if (copy_rtx_packet->PayloadSize() >= kFecSnBaseOffset + 2)
+			{
+				uint8_t *sn_base = copy_rtx_packet->Payload() + kFecSnBaseOffset;
+				ByteWriter<uint16_t>::WriteBigEndian(sn_base, ByteReader<uint16_t>::ReadBigEndian(sn_base) + offset);
+			}
+		}
+
+		if (debug_rtx)
+		{
+			const uint8_t *osn = copy_rtx_packet->Payload() - RTX_HEADER_SIZE;
+			logtw("RtxDebug session=%u nack_seq=%u log_seq=%u origin_seq=%u pt=%u hist_seq=%u hist_ts=%u log_ts=%u osn_bytes=%u rtx_seq=%u len=%zu",
+				  GetId(), seq_no, sent_log->_sequence_number, sent_log->_origin_sequence_number, sent_log->_payload_type,
+				  rtx_packet->GetOriginalSequenceNumber(), rtx_packet->Timestamp(), sent_log->_timestamp,
+				  static_cast<unsigned>((osn[0] << 8) | osn[1]), copy_rtx_packet->SequenceNumber(), copy_rtx_packet->GetDataLength());
+		}
+		EnqueueRtx(copy_rtx_packet);
+
+		if (oldest_repaired.has_value() == false || static_cast<int16_t>(seq_no - *oldest_repaired) < 0)
+		{
+			oldest_repaired = seq_no;
+		}
+	}
+
+	// OME_TEST_NO_PADDING_REPLAY=1 turns the replay off, to measure what it is worth
+	static const bool no_padding_replay = std::getenv("OME_TEST_NO_PADDING_REPLAY") != nullptr;
+	if (oldest_repaired.has_value() && no_padding_replay == false)
+	{
+		ReannounceFecPadding(stream, *oldest_repaired);
+	}
+
+	return true;
+}
+
+bool RtcSession::RtxWanted(uint16_t sequence_number, size_t bytes)
+{
+	const auto now = std::chrono::steady_clock::now();
+
+	// The viewer restarts from the newest keyframe: older packets only cost path capacity
+	if (_has_sent_keyframe)
+	{
+		const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+		if (now_ms - _newest_keyframe_sent_ms.load() >= kKeyframeSupersedesMs &&
+			static_cast<int16_t>(sequence_number - _newest_keyframe_sequence_number.load()) < 0)
+		{
+			return false;
+		}
+	}
+
+	// Until the media rate is known (the first second), retransmissions are not limited; nor without
+	// <SendPacing>, which is what sends them ahead of queued media
+	const double media_rate = _media_bytes_per_second.load();
+	if (media_rate == 0 || _send_pacing_enabled == false)
+	{
+		return true;
+	}
+	const double burst = static_cast<double>(std::max(_pacing_burst_bytes.load(), kMinPacingBurstBytes));
+	if (_rtx_refilled_at == std::chrono::steady_clock::time_point{})
+	{
+		_rtx_tokens = burst;
+	}
+	else
+	{
+		_rtx_tokens = std::min(burst, _rtx_tokens + kRtxRateFactor * media_rate * std::chrono::duration<double>(now - _rtx_refilled_at).count());
+	}
+	_rtx_refilled_at = now;
+
+	if (_rtx_tokens < static_cast<double>(bytes))
+	{
+		return false;  // the receiver asks again
+	}
+	_rtx_tokens -= static_cast<double>(bytes);
+	return true;
+}
+
+void RtcSession::EnqueueRtx(const std::shared_ptr<RtpPacket> &rtx_packet)
+{
+	if (_send_running.load(std::memory_order_acquire) == false)
+	{
+		return;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(_rtx_queue_lock);
+		_rtx_queue.push_back(rtx_packet);
+	}
+	_send_queue.Enqueue(nullptr);
+}
+
+void RtcSession::SendQueuedRtx()
+{
+	while (true)
+	{
+		std::shared_ptr<RtpPacket> rtx_packet;
+		{
+			std::lock_guard<std::mutex> lock(_rtx_queue_lock);
+			if (_rtx_queue.empty())
+			{
+				return;
+			}
+			rtx_packet = std::move(_rtx_queue.front());
+			_rtx_queue.pop_front();
+		}
+		SendRtx(rtx_packet);
+	}
+}
+
+void RtcSession::SendRtx(const std::shared_ptr<RtpPacket> &rtx_packet)
+{
+	std::shared_lock<std::shared_mutex> lock(_start_stop_lock);
+	if (pub::Session::GetState() != SessionState::Started)
+	{
+		return;
+	}
+
+	PaceSend(rtx_packet->GetDataLength(), false);
+
+	// A fresh transport-wide number, as libwebrtc does. The copy carried the original's: a lost packet then
+	// read as received an RTT late, and its frame's packet train as hugely spread (a tiny capacity sample).
+	if (_video_transport_cc_enabled && SetTransportWideSequenceNumber(rtx_packet, _wide_sequence_number))
+	{
+		if (_bandwidth_estimator != nullptr)
+		{
+			_bandwidth_estimator->OnRtpSent(_wide_sequence_number, rtx_packet, true);
+		}
+		_wide_sequence_number++;
+	}
+
+	_rtp_rtcp->SendRtpPacket(rtx_packet);
+}
+
+bool RtcSession::ShedVideo(const std::shared_ptr<const RtpPacket> &packet, bool is_fec, bool is_key_media)
+{
+	if (_video_shedding_enabled == false)
+	{
+		return false;
+	}
+	if (is_fec == false && packet->IsFirstPacketOfFrame())
+	{
+		if (is_key_media)
+		{
+			if (_shedding)
+			{
+				logtd("RtcShed session=%u resumed at a keyframe after %" PRIu64 " frame(s) (episode %" PRIu64 ")", GetId(), _shed_frames, _shed_episodes);
+				_shed_resumed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+			}
+			_shedding = false;
+		}
+		else if (_shedding == false && _bandwidth_estimator != nullptr && _has_sent_keyframe &&
+				 _bandwidth_estimator->GetQueueSampleSendMs() >= _shed_resumed_ms)
+		{
+			const int64_t queue_ms = _bandwidth_estimator->GetQueueDelayMs();
+			const double growth = _bandwidth_estimator->GetQueueGrowth();
+			const double loss = _bandwidth_estimator->GetRecentLoss();
+			const auto rendition = GetCurrentRendition();
+			const bool can_switch_down = _auto_abr && GetNextRendition() == nullptr && rendition != nullptr &&
+										 _playlist->GetNextLowerBitrateRendition(rendition) != nullptr;
+			// OME_TEST_SHED_QUEUE_MS overrides the threshold, to measure it (0: never shed)
+			static const int64_t shed_queue_ms = std::getenv("OME_TEST_SHED_QUEUE_MS") ? std::atoll(std::getenv("OME_TEST_SHED_QUEUE_MS")) : kShedQueueDelayMs;
+			// A link that carries what this session sends drains the queue by itself (see kShedCapacity)
+			const double capacity_bps = _bandwidth_estimator->GetLinkCapacityBps();
+			const double media_bps = std::max(_unshed_media_bytes_per_second * 8.0, rendition != nullptr ? static_cast<double>(rendition->GetBitrates()) : 0.0);
+			const bool link_narrower = capacity_bps <= 0 || media_bps <= 0 || capacity_bps < media_bps * kShedCapacity;
+			if (shed_queue_ms > 0 && queue_ms > shed_queue_ms && (growth > kShedQueueGrowth || loss > kShedLoss) &&
+				link_narrower && can_switch_down == false)
+			{
+				_shedding = true;
+				_shed_in_media_window = true;
+				_shed_frames = 0;
+				_shed_episodes++;
+				logtd("RtcShed session=%u queue=%" PRId64 " ms growth=%.2f loss=%.1f%% capacity=%.2f/%.2f Mbps: video waits for the next keyframe", GetId(), queue_ms, growth, loss * 100, capacity_bps / 1e6, media_bps / 1e6);
+			}
+		}
+
+		if (_shedding == false)
+		{
+			_last_sent_video_timestamp = packet->Timestamp();
+		}
+		else
+		{
+			_shed_frames++;
+		}
+	}
+
+	// The parity of the last frame sent still goes out; its media did
+	return _shedding && (is_fec == false || packet->Timestamp() != _last_sent_video_timestamp);
+}
+
+void RtcSession::PaceSend(size_t bytes, bool is_media)
+{
+	auto now = std::chrono::steady_clock::now();
+
+	// The media rate, measured over 1 s windows (smoothed over ~4): the stream's own bitrate, which
+	// the path to this viewer carried so far
+	if (is_media)
+	{
+		if (_media_bytes_in_window == 0 && _media_bytes_per_second == 0)
+		{
+			_media_window_start = now;
+		}
+		_media_bytes_in_window += bytes;
+		const double window_s = std::chrono::duration<double>(now - _media_window_start).count();
+		if (window_s >= 1.0)
+		{
+			const double sample = static_cast<double>(_media_bytes_in_window) / window_s;
+			_media_bytes_per_second = (_media_bytes_per_second == 0) ? sample : (0.75 * _media_bytes_per_second + 0.25 * sample);
+			if (_shed_in_media_window == false)
+			{
+				_unshed_media_bytes_per_second = (_unshed_media_bytes_per_second == 0) ? sample : (0.75 * _unshed_media_bytes_per_second + 0.25 * sample);
+			}
+			_shed_in_media_window = _shedding;
+			_media_bytes_in_window = 0;
+			_media_window_start = now;
+		}
+	}
+
+	if (_send_pacing_enabled == false || _pacing_burst_bytes == 0 || _media_bytes_per_second == 0)
+	{
+		return;
+	}
+
+	// Not below the current rendition's own bitrate: just after an up-switch the measured rate is still the
+	// old rung's, and pacing the new one at it throttled it (and the bandwidth estimator measured the pacer)
+	const auto rendition = GetCurrentRendition();
+	const double rendition_bytes_per_second = (rendition != nullptr) ? static_cast<double>(rendition->GetBitrates()) / 8.0 : 0.0;
+	const double rate = kPacingFactor * std::max(_media_bytes_per_second.load(), rendition_bytes_per_second);
+	if (_pacing_refilled_at == std::chrono::steady_clock::time_point{})
+	{
+		_pacing_tokens = static_cast<double>(_pacing_burst_bytes);
+	}
+	else
+	{
+		_pacing_tokens += rate * std::chrono::duration<double>(now - _pacing_refilled_at).count();
+		_pacing_tokens = std::min(_pacing_tokens, static_cast<double>(_pacing_burst_bytes));
+	}
+	_pacing_refilled_at = now;
+
+	if (_pacing_tokens < 0)
+	{
+		std::this_thread::sleep_for(std::chrono::duration<double>(-_pacing_tokens / rate));
+		_pacing_tokens = 0;
+		_pacing_refilled_at = std::chrono::steady_clock::now();
+	}
+
+	// The packet may overdraw: the next one waits for it
+	_pacing_tokens -= static_cast<double>(bytes);
+}
+
+// With RED/ULPFEC the parity packets take video sequence numbers between frames. libwebrtc's H.264
+// reference finder (RtpSeqNumOnlyRefFinder) bridges those numbers as padding, but forgets padding more
+// than 100 sequence numbers older than the newest it has seen (kMaxPaddingAge). A frame repaired later
+// than that finds no bridge to the next one, and every following frame is stashed until a keyframe:
+// up to a GOP, as OME does not answer PLI. So once a retransmission repairs an old packet, the FEC
+// sequence numbers the receiver has forgotten since then are announced again, right behind it: each
+// as an RTX packet with an empty payload, which the receiver restores to an empty packet and takes as
+// padding (~30 bytes). The receiver never asks for these (it saw the originals), so each is sent twice.
+//
+// Each one costs the receiver a frame search, so only the forgotten ones are replayed, and at most
+// kMaxReplayed per NACK.
+void RtcSession::ReannounceFecPadding(const std::shared_ptr<RtcStream> &stream, uint16_t repaired_sequence_number)
+{
+	// libwebrtc keeps padding up to 100 sequence numbers behind the newest; replay what is older than
+	// (newest - kStillKnown), which leaves a margin for packets still on their way
+	constexpr uint16_t kStillKnown = 80;
+	// libwebrtc keeps at most 1000 missing packets in its NACK list
+	constexpr uint16_t kMaxReplayRange = 1000;
+	constexpr size_t kMaxReplayed = 64;
+	constexpr int kCopies = 2;
+
+	uint16_t newest;
+	{
+		std::shared_lock<std::shared_mutex> lock(_rtp_record_map_lock);
+		if (_has_sent_video_record == false)
+		{
+			return;
+		}
+		newest = _newest_video_sent_sequence_number;
+	}
+
+	const uint16_t age = newest - repaired_sequence_number;
+	if (age <= kStillKnown || age > kMaxReplayRange)
+	{
+		return;
+	}
+
+	// From just after the repaired packet up to (newest - kStillKnown)
+	const uint16_t count = age - kStillKnown;
+	size_t replayed = 0;
+	for (uint16_t i = 1; i < count && replayed < kMaxReplayed; i++)
+	{
+		const uint16_t seq = repaired_sequence_number + i;
+		auto sent_log = TraceRtpSentByVideoSeqNo(seq);
+		if (sent_log == nullptr || sent_log->_is_fec == false)
+		{
+			continue;
+		}
 
 		auto rtx_packet = stream->GetRtxRtpPacket(sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
 		if (rtx_packet == nullptr)
@@ -1139,12 +1659,41 @@ bool RtcSession::ProcessNACK(const std::shared_ptr<RtcpInfo> &rtcp_info)
 			continue;
 		}
 
-		auto copy_rtx_packet = std::make_shared<RtxRtpPacket>(*rtx_packet);
-		copy_rtx_packet->SetSequenceNumber(_rtx_sequence_number++);
-		copy_rtx_packet->SetOriginalSequenceNumber(sent_log->_sequence_number);
-		_rtp_rtcp->SendRtpPacket(copy_rtx_packet);
+		for (int copy = 0; copy < kCopies; copy++)
+		{
+			auto padding = std::make_shared<RtxRtpPacket>(*rtx_packet);
+			padding->SetPayloadSize(0);
+			padding->SetSequenceNumber(_rtx_sequence_number++);
+			padding->SetOriginalSequenceNumber(seq);
+			EnqueueRtx(padding);
+		}
+		replayed++;
+	}
+}
+
+// ULPFEC's SN base (RFC 5109) names the first protected packet by sequence number, and the stream
+// numbers its packets once for all sessions, while each session renumbers what it sends. Without
+// moving the base into this session's numbering the mask names other packets: a receiver never
+// recovers anything, or recovers the wrong packet. The packets from the base up to this parity must
+// have been sent here with the same offset, so that the mask's positions still hold.
+bool RtcSession::RemapFecSnBase(RtpPacket &fec_packet, uint16_t origin_sequence_number, uint16_t session_sequence_number)
+{
+	if (fec_packet.PayloadSize() < kFecSnBaseOffset + 2)
+	{
+		return false;
 	}
 
+	uint8_t *sn_base = fec_packet.Payload() + kFecSnBaseOffset;
+	const uint16_t origin_base = ByteReader<uint16_t>::ReadBigEndian(sn_base);
+	const uint16_t offset = session_sequence_number - origin_sequence_number;
+
+	const auto &base = _video_sequence_map[origin_base % kSequenceMapSize];
+	if (base.valid == false || base.origin != origin_base || static_cast<uint16_t>(base.session - base.origin) != offset)
+	{
+		return false;
+	}
+
+	ByteWriter<uint16_t>::WriteBigEndian(sn_base, base.session);
 	return true;
 }
 

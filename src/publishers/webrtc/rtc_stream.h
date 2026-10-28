@@ -22,6 +22,8 @@
 
 #include <atomic>
 #include <thread>
+#include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -51,6 +53,13 @@ public:
 
 	std::shared_ptr<const SessionDescription> GetSessionDescription(const ov::String &file_name);
 	std::shared_ptr<const RtcPlaylist> GetRtcPlaylist(const ov::String &file_name, cmn::MediaCodecId video_codec_id, cmn::MediaCodecId audio_codec_id);
+	// <PlayoutDelay>: every video packet carries min/max; a session may raise them for its viewer
+	bool IsPlayoutDelayEnabled() const { return _playout_delay_enabled; }
+	int GetPlayoutDelayMin() const { return _playout_delay_min; }
+	int GetPlayoutDelayMax() const { return _playout_delay_max; }
+	bool IsAdaptivePlayoutDelayEnabled() const { return _adaptive_playout_delay_enabled; }
+	bool IsSendPacingEnabled() const { return _send_pacing_enabled; }
+	bool IsVideoSheddingEnabled() const { return _video_shedding_enabled; }
 
 	void SendVideoFrame(const std::shared_ptr<MediaPacket> &media_packet) override;
 	void SendAudioFrame(const std::shared_ptr<MediaPacket> &media_packet) override;
@@ -69,6 +78,8 @@ public:
 	void ClearSessionDemandedTracks(session_id_t session_id);
 	bool IsTrackDemanded(uint32_t track_id) const;
 	bool IsTrackFullyDemanded(uint32_t track_id) const;
+	// Whether a video frame of this track is packetized at all (see _pending_rung_keyframe_at)
+	bool PassesDemandFilter(uint32_t track_id, bool is_keyframe, std::chrono::steady_clock::time_point now);
 
 	// RtpRtcpPacketizerInterface Implementation
 	bool OnRtpPacketized(std::shared_ptr<RtpPacket> packet) override;
@@ -141,11 +152,16 @@ private:
 	bool _playout_delay_enabled = false;
 	int _playout_delay_min		= 0;
 	int _playout_delay_max		= 0;
+	bool _adaptive_playout_delay_enabled = false;
+	bool _send_pacing_enabled			 = false;
+	bool _video_shedding_enabled		 = false;
 
 	// Always true once pace groups are created: packetize runs on per-rung
 	// DelayQueue threads. <JitterBuffer> only enables AdaptiveDelay hold.
 	bool _pacer_enabled = false;
 	bool _jitter_buffer_enabled = false;
+	int _jitter_buffer_min_ms	= 20;
+	int _jitter_buffer_max_ms	= 500;
 
 	bool _transport_cc_enabled = false;
 	bool _remb_enabled		   = false;
@@ -189,6 +205,21 @@ private:
 	// fan-out alongside RED when Ulpfec is on).
 	std::unordered_set<uint32_t> _tracks_needing_raw_rtp;
 	mutable std::shared_mutex _demand_lock;
+	// A pending ABR target is packetized from its keyframe on: the session switches only when that
+	// keyframe leaves the pacer, and frames arriving meanwhile would otherwise be cut as keyframe-only.
+	// The first viewer to switch to an unwatched rung then lacked the frame after the keyframe, and
+	// decoded every later frame against the wrong reference until the next keyframe. Bounded by
+	// kPendingRungHold in case no session switches after all.
+	static constexpr std::chrono::milliseconds kPendingRungHold{1000};
+	std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> _pending_rung_keyframe_at;
+	std::mutex _pending_rung_lock;
+
+	// B-frames (PTS stepping back in decode order) on a WebRTC video track: warned once per track.
+	// Chrome's software H.264 decoder takes one frame out per frame in and treats the reorder delay
+	// as an error, and Chrome falls back to it for good after any hardware decode error.
+	std::unordered_map<uint32_t, int64_t> _last_video_pts;
+	std::unordered_set<uint32_t> _bframe_warned_tracks;
+	std::mutex _bframe_check_lock;
 
 	ov::String _default_playlist_name;
 
