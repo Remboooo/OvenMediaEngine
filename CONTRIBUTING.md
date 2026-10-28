@@ -30,11 +30,14 @@ We review our code countless times before release, but we can make mistakes. So 
 ### Writing Code
 OvenMediaEngine is written in C++ and uses Clang Thread Safety Analysis (TSA) to catch data races at compile time. Before contributing C++ code, please read the [Thread Safety Analysis (TSA) Guide](https://github.com/OvenMediaLabs/OvenMediaEngine/blob/master/src/base/ovlibrary/tsa/README.md). It explains the `ov::` synchronization types and the `OV_*` annotations to use, with examples and troubleshooting.
 
+In this fork, test a change to the media path (WebRTC, RTP/RTCP, the pacer, the transcoder, the providers or LL-HLS) with the [pre-release real-world test](misc/README.md) before you open a pull request. It measures frame drops, freezes, delay and memory with real browsers on simulated networks, and says what to put in the pull request.
+
 ### Sharing Ideas
 If you have any ideas about technology trends that can advance OvenMediaEngine and OvenPlayer and features that will work synergistically, please request us. We are ready to review and embrace it for development.
 
 ### Testing
 After the OvenMediaEngine and OvenPlayer updates, we may request you to test as we have responsibility for ensuring stability in more environments. Therefore, we would be very grateful if you could help us run the test.
+- The pre-release real-world test of this fork, which you can run yourself: [misc/README.md](misc/README.md)
 - [For OvenMediaEngine](https://github.com/OvenMediaLabs/OvenMediaEngine/issues)
 - [For OvenPlayer](https://github.com/OvenMediaLabs/OvenPlayer/issues)
 
