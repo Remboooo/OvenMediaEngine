@@ -66,6 +66,13 @@ namespace mon
 		
 
 	private:
+		// Subtracts the sessions still counted on a deleted stream from every level, once. Requires `_session_guard`.
+		void ReleaseSessions(const std::shared_ptr<StreamMetrics> &stream_metric);
+
+		// Serialises session events with `ReleaseSessions()`, so that each session is subtracted exactly once:
+		// either by its own disconnect, or with its stream.
+		std::mutex _session_guard;
+
 		ov::DelayQueue _timer{"MonLogTimer"};
 		mutable std::shared_mutex _server_metric_guard;
 		std::shared_ptr<ServerMetrics> _server_metric = nullptr;
