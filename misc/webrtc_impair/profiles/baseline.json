@@ -1,0 +1,290 @@
+{
+ "clean": {
+  "complete": [
+   1.0,
+   1.0,
+   1.0,
+   1.0,
+   1.0
+  ],
+  "freezes": {
+   "chrome": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0049,
+    0.0007,
+    0.0066,
+    0.0016,
+    0.0023
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "loss_1pct": {
+  "complete": [
+   0.9822,
+   0.9825,
+   0.9816,
+   0.9825,
+   0.9819
+  ],
+  "freezes": {
+   "chrome": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0059,
+    0.0053,
+    0.0059,
+    0.0085,
+    0.0115
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "burst_loss": {
+  "complete": [
+   0.9803,
+   0.9724,
+   0.9828,
+   0.9816,
+   0.9835
+  ],
+  "freezes": {
+   "chrome": [
+    1,
+    0,
+    0,
+    1,
+    0
+   ],
+   "firefox": [
+    0,
+    1,
+    0,
+    0,
+    2
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0089,
+    0.0085,
+    0.0105,
+    0.0181,
+    0.0059
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "jitter_reorder": {
+  "complete": [
+   0.9239,
+   0.9562,
+   0.9541,
+   0.9767,
+   0.9649
+  ],
+  "freezes": {
+   "chrome": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0039,
+    0.0026,
+    0.0016,
+    0.0079,
+    0.0066
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "stalls": {
+  "complete": [
+   1.0,
+   0.9952,
+   0.9952,
+   0.9927,
+   0.9901
+  ],
+  "freezes": {
+   "chrome": [
+    1,
+    1,
+    1,
+    2,
+    1
+   ],
+   "firefox": [
+    2,
+    2,
+    2,
+    2,
+    2
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0151,
+    0.0125,
+    0.0131,
+    0.021,
+    0.0092
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ },
+ "real_world_mix": {
+  "complete": [
+   0.978,
+   0.9761,
+   0.9638,
+   0.9701,
+   0.9777
+  ],
+  "freezes": {
+   "chrome": [
+    1,
+    0,
+    0,
+    0,
+    2
+   ],
+   "firefox": [
+    1,
+    0,
+    2,
+    1,
+    0
+   ]
+  },
+  "runs": [
+   "cmp_capped_r1",
+   "cmp_capped_r2",
+   "cmp_capped_r3",
+   "cmp_capped_r4",
+   "cmp_capped_r5"
+  ],
+  "dropped": {
+   "chrome": [
+    0.0151,
+    0.0168,
+    0.0073,
+    0.0171,
+    0.014
+   ],
+   "firefox": [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  }
+ }
+}

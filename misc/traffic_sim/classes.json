@@ -1,0 +1,60 @@
+{
+ "_what": "Network classes for sim_relay.py. down = OME -> client (UDP), up = client -> OME (UDP), tcp = both directions of TCP (signalling, LL-HLS, RTMP ingest). Keys as in webrtc_impair/impair_relay.py. Re-read live.",
+ "fiber": {
+  "_what": "FTTH: clean, 3 ms",
+  "down": {"delay_ms": 3, "jitter_ms": 0.5},
+  "up": {"delay_ms": 3},
+  "tcp": {"delay_ms": 3}
+ },
+ "residential": {
+  "_what": "Cable/DSL: 0.3% loss + rare bursts, 15+-8 ms, 0.5% reorder, 200 ms stall every 40 s (webrtc_impair real_world_mix)",
+  "down": {"loss": 0.003, "burst": {"p_enter": 0.0005, "p_exit": 0.2, "loss": 1.0},
+           "delay_ms": 15, "jitter_ms": 8, "reorder": 0.005, "reorder_ms": 25,
+           "stall_every_s": 40, "stall_ms": 200, "start_after_s": 5},
+  "up": {"delay_ms": 15, "jitter_ms": 4, "loss": 0.002},
+  "tcp": {"delay_ms": 15, "jitter_ms": 4, "loss": 0.003}
+ },
+ "wifi": {
+  "_what": "Busy 2.4 GHz Wi-Fi: 1% loss in bursts, 25+-15 ms, 1% reorder, 500 ms stall every 25 s",
+  "down": {"loss": 0.005, "burst": {"p_enter": 0.001, "p_exit": 0.15, "loss": 0.8},
+           "delay_ms": 25, "jitter_ms": 15, "reorder": 0.01, "reorder_ms": 30,
+           "stall_every_s": 25, "stall_ms": 500, "start_after_s": 3},
+  "up": {"delay_ms": 25, "jitter_ms": 10, "loss": 0.01},
+  "tcp": {"delay_ms": 25, "jitter_ms": 10, "loss": 0.01, "stall_every_s": 25, "stall_ms": 500}
+ },
+ "mobile_4g": {
+  "_what": "4G: 8 Mbps bottleneck with 300 ms queue, 60+-25 ms, 0.5% loss, 1 s stall every 30 s (handover)",
+  "down": {"loss": 0.005, "delay_ms": 60, "jitter_ms": 25, "rate_mbps": 8, "queue_ms": 300,
+           "stall_every_s": 30, "stall_ms": 1000, "start_after_s": 3},
+  "up": {"delay_ms": 60, "jitter_ms": 20, "loss": 0.01, "rate_mbps": 2},
+  "tcp": {"delay_ms": 60, "jitter_ms": 20, "loss": 0.005, "rate_mbps": 8, "stall_every_s": 30, "stall_ms": 1000}
+ },
+ "terrible": {
+  "_what": "Hotel Wi-Fi: 3 Mbps, 5% loss, heavy bursts, 120+-60 ms, 2 s stall every 20 s. Only must not hurt the server or other viewers.",
+  "down": {"loss": 0.03, "burst": {"p_enter": 0.003, "p_exit": 0.1, "loss": 0.9},
+           "delay_ms": 120, "jitter_ms": 60, "reorder": 0.02, "reorder_ms": 50, "duplicate": 0.01,
+           "rate_mbps": 3, "queue_ms": 400, "stall_every_s": 20, "stall_ms": 2000, "start_after_s": 2},
+  "up": {"delay_ms": 120, "jitter_ms": 40, "loss": 0.05},
+  "tcp": {"delay_ms": 120, "jitter_ms": 40, "loss": 0.03, "rate_mbps": 3, "stall_every_s": 20, "stall_ms": 2000}
+ },
+ "lim": {
+  "_what": "limits.py's viewer class: clean here, set live per test step with set_class",
+  "down": {}, "up": {}, "tcp": {}
+ },
+ "uplink_lim": {
+  "_what": "limits.py's encoder uplink class: clean here, set live per test step with set_class",
+  "tcp": {}
+ },
+ "uplink_clean": {
+  "_what": "Encoder on a good line",
+  "tcp": {"delay_ms": 5}
+ },
+ "uplink_jitter": {
+  "_what": "Encoder on a jittery residential uplink",
+  "tcp": {"delay_ms": 20, "jitter_ms": 15, "loss": 0.002}
+ },
+ "uplink_stalls": {
+  "_what": "Encoder whose uplink stalls 1.5 s every 45 s",
+  "tcp": {"delay_ms": 20, "jitter_ms": 5, "stall_every_s": 45, "stall_ms": 1500}
+ }
+}

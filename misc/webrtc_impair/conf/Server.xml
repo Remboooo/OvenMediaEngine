@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WebRTC impairment harness: production-like live app, Bypass only, all ICE via impair_relay.py.
+     OME listens on 127.0.0.1 only; run.sh exposes signalling (23333) and ICE (24000-24005) on this machine's LAN address (OME_TEST_LAN_IP, which run.sh sets).
+     Separate ports from production (3333/1935/10000+) and segcache dogfood (13333/11000+). -->
+<Server version="8">
+	<Name>OME-WebRTC-Impair</Name>
+	<Type>origin</Type>
+	<IP>127.0.0.1</IP>
+
+	<Bind>
+		<Managers>
+			<API>
+				<Port>28081</Port>
+				<WorkerCount>2</WorkerCount>
+			</API>
+		</Managers>
+
+		<Providers>
+			<RTMP>
+				<Port>21935</Port>
+			</RTMP>
+		</Providers>
+
+		<Publishers>
+			<LLHLS>
+				<Port>23333</Port>
+			</LLHLS>
+			<WebRTC>
+				<Signalling>
+					<Port>23333</Port>
+				</Signalling>
+				<!-- OME binds 127.0.0.1:24000-24005 but advertises the LAN address, where
+				     impair_relay.py listens on the same ports: viewers only reach OME through it. -->
+				<IceCandidates>
+					<IceCandidate>${env:OME_TEST_LAN_IP}:24000-24005/udp</IceCandidate>
+				</IceCandidates>
+			</WebRTC>
+		</Publishers>
+	</Bind>
+
+	<Managers>
+		<Host>
+			<Names>
+				<Name>*</Name>
+			</Names>
+		</Host>
+		<API>
+			<AccessToken>webrtc-impair-local</AccessToken>
+		</API>
+	</Managers>
+
+	<VirtualHosts>
+		<VirtualHost>
+			<Name>default</Name>
+			<Host>
+				<Names>
+					<Name>*</Name>
+				</Names>
+			</Host>
+			<Applications>
+				<Application>
+					<Name>live</Name>
+					<Type>live</Type>
+					<OutputProfiles>
+						<OutputProfile>
+							<Name>bypass</Name>
+							<OutputStreamName>${OriginStreamName}</OutputStreamName>
+							<Encodes>
+								<Video>
+									<Name>bypass_video</Name>
+									<Bypass>true</Bypass>
+								</Video>
+								<Audio>
+									<Name>opus</Name>
+									<Codec>opus</Codec>
+									<Bitrate>64000</Bitrate>
+									<Samplerate>48000</Samplerate>
+									<Channel>2</Channel>
+								</Audio>
+								<Audio>
+									<Name>bypass_audio</Name>
+									<Bypass>true</Bypass>
+								</Audio>
+							</Encodes>
+							<Playlist>
+								<Name>auto</Name>
+								<FileName>auto</FileName>
+								<Options>
+									<WebRtcAutoAbr>true</WebRtcAutoAbr>
+								</Options>
+								<Rendition>
+									<Name>Bypass+opus</Name>
+									<Video>bypass_video</Video>
+									<Audio>opus</Audio>
+								</Rendition>
+								<Rendition>
+									<Name>Bypass</Name>
+									<Video>bypass_video</Video>
+									<Audio>bypass_audio</Audio>
+								</Rendition>
+							</Playlist>
+						</OutputProfile>
+					</OutputProfiles>
+					<Providers>
+						<RTMP />
+					</Providers>
+					<Publishers>
+						<AppWorkerCount>4</AppWorkerCount>
+						<StreamWorkerCount>4</StreamWorkerCount>
+						<WebRTC>
+							<Timeout>30000</Timeout>
+							<Rtx>true</Rtx>
+							<Ulpfec>true</Ulpfec>
+							<JitterBuffer>true</JitterBuffer>
+							<JitterBufferDelay><Min>80</Min><Max>500</Max></JitterBufferDelay>
+							<SendPacing>true</SendPacing>
+							<VideoShedding>true</VideoShedding>
+							<PlayoutDelay><Min>50</Min><Max>200</Max><Adaptive>true</Adaptive></PlayoutDelay>
+						</WebRTC>
+						<LLHLS>
+							<ChunkDuration>.2</ChunkDuration>
+							<SegmentDuration>6</SegmentDuration>
+							<SegmentCount>10</SegmentCount>
+							<CrossDomains>
+								<Url>*</Url>
+							</CrossDomains>
+						</LLHLS>
+					</Publishers>
+				</Application>
+			</Applications>
+		</VirtualHost>
+	</VirtualHosts>
+</Server>

@@ -1,0 +1,3 @@
+{"_what": "Wi-Fi-like jitter: 20ms base, 12ms sigma (natural reordering) + 1% explicit reorder by 30ms",
+ "down": {"delay_ms": 20, "jitter_ms": 12, "reorder": 0.01, "reorder_ms": 30, "start_after_s": 5},
+ "up": {"delay_ms": 20, "jitter_ms": 5}}

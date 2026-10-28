@@ -10,3 +10,7 @@ stress_summary_*.json
 summary_*.json
 hlsjs_soak/node_modules/
 dogfood/media/*.mp4
+dogfood/media/*.ts
+dogfood/media/*.flv
+hlsjs_soak/probe_out/
+dogfood/media/*.keyframes.json

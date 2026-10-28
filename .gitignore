@@ -48,3 +48,6 @@ src/main/git_info.h
 # For third-party libraries
 misc/oven_rtc_tester/OvenRtcTester
 misc/FFmpeg*
+
+# Notes and deploy scripts for one particular production server (its own local git repo, never pushed)
+misc/private/

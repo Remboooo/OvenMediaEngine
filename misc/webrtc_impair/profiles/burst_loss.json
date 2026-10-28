@@ -1,0 +1,2 @@
+{"_what": "Gilbert-Elliott bursts (~8 packets): longer gaps than one FEC group can repair, many NACKs at once",
+ "down": {"burst": {"p_enter": 0.002, "p_exit": 0.12, "loss": 1.0}, "start_after_s": 5}, "up": {}}

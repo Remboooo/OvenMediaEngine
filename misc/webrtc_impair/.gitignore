@@ -1,0 +1,7 @@
+logs/
+run/
+profiles/active.json
+profiles/active_ingest.json
+__pycache__/
+conf/Server.id
+conf_nofeatures/

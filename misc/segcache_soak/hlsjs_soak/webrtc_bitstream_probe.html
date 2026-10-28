@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC bitstream probe</title>
+</head>
+<body>
+<script type="module">
+// Captures every encoded video frame Chrome assembles from OME's RTP (after
+// depacketization, before the decoder) and hands it to the Node runner via
+// window.__probeFrames. Frames are not passed on to the decoder, so the probe
+// costs almost no CPU even at 4K60.
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get('ws');
+const rendition = params.get('rendition') || '';
+
+const out = (window.__PROBE__ = { state: 'connecting', ice: null, error: null, red: null, api: null, frames: 0, stats: null });
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+let batch = [];
+function onFrame(frame) {
+  const md = frame.getMetadata ? frame.getMetadata() : {};
+  batch.push({
+    t: Date.now(),
+    rtp: frame.timestamp ?? md.rtpTimestamp,
+    type: frame.type,
+    ssrc: md.synchronizationSource,
+    pt: md.payloadType,
+    w: md.width,
+    h: md.height,
+    b64: toBase64(frame.data),
+  });
+  out.frames++;
+}
+setInterval(() => {
+  if (batch.length === 0) return;
+  const b = batch;
+  batch = [];
+  window.__probeFrames(JSON.stringify(b));
+}, 250);
+
+function attachTransform(receiver) {
+  if (typeof receiver.createEncodedStreams === 'function') {
+    out.api = 'createEncodedStreams';
+    const { readable } = receiver.createEncodedStreams();
+    // Writable side intentionally never fed: nothing reaches the decoder.
+    readable.pipeTo(new WritableStream({ write: onFrame })).catch((e) => (out.error = 'pipe: ' + e));
+    return;
+  }
+  if (typeof RTCRtpScriptTransform === 'function') {
+    out.api = 'RTCRtpScriptTransform';
+    const src = `onrtctransform = (e) => {
+      const r = e.transformer.readable;
+      r.pipeTo(new WritableStream({ write(f) {
+        const md = f.getMetadata();
+        const data = f.data;
+        self.postMessage({ rtp: f.timestamp ?? md.rtpTimestamp, type: f.type, ssrc: md.synchronizationSource,
+                           pt: md.payloadType, w: md.width, h: md.height, data }, [data]);
+      } }));
+    };`;
+    const worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    worker.onmessage = (m) => onFrame({ ...m.data, getMetadata: () => m.data, timestamp: m.data.rtp });
+    receiver.transform = new RTCRtpScriptTransform(worker, {});
+    return;
+  }
+  out.error = 'no encoded transform API in this Chromium';
+}
+
+const ws = new WebSocket(wsUrl);
+let pc = null;
+let sessionId = null;
+let peerId = null;
+
+ws.onopen = () => ws.send(JSON.stringify({ command: 'request_offer' }));
+ws.onerror = () => { out.error = 'websocket error'; };
+ws.onclose = () => { if (out.state !== 'playing') out.error ??= 'websocket closed'; };
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.error) { out.error = `signalling ${msg.code}: ${msg.error}`; return; }
+  if (msg.command !== 'offer') return;
+  try {
+    sessionId = msg.id;
+    peerId = msg.peer_id;
+    pc = new RTCPeerConnection({ encodedInsertableStreams: true });
+    pc.ontrack = (e) => { if (e.track.kind === 'video') attachTransform(e.receiver); };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) ws.send(JSON.stringify({ command: 'candidate', id: sessionId, peer_id: peerId, candidates: [e.candidate] }));
+    };
+    pc.oniceconnectionstatechange = () => { out.ice = pc.iceConnectionState; };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') out.state = 'playing';
+      if (pc.connectionState === 'failed') out.error = 'peer connection failed';
+    };
+    out.red = /a=rtpmap:\d+ red\/90000/i.test(msg.sdp.sdp);
+    out.offer = msg.sdp.sdp;
+    await pc.setRemoteDescription(msg.sdp);
+    for (const c of msg.candidates ?? []) await pc.addIceCandidate(c);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ command: 'answer', id: sessionId, peer_id: peerId, sdp: answer }));
+    if (rendition) {
+      ws.send(JSON.stringify({ command: 'change_rendition', id: sessionId, peer_id: peerId, rendition_name: rendition, auto: false }));
+    }
+  } catch (e) {
+    out.error = String(e);
+  }
+};
+
+setInterval(async () => {
+  if (!pc) return;
+  const stats = await pc.getStats();
+  stats.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') {
+      out.stats = { t: Date.now(), packetsReceived: s.packetsReceived, packetsLost: s.packetsLost, framesReceived: s.framesReceived,
+                    nackCount: s.nackCount, pliCount: s.pliCount, fecPacketsReceived: s.fecPacketsReceived, fecPacketsDiscarded: s.fecPacketsDiscarded,
+                    retransmittedPacketsReceived: s.retransmittedPacketsReceived, retransmittedBytesReceived: s.retransmittedBytesReceived,
+                    rtxSsrc: s.rtxSsrc, fecSsrc: s.fecSsrc, ssrc: s.ssrc, frameWidth: s.frameWidth };
+    }
+  });
+}, 1000);
+</script>
+</body>
+</html>

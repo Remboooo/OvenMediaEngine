@@ -1,0 +1,2 @@
+{"_what": "Every 15s the link freezes for 250ms then dumps the backlog (Wi-Fi scan / roaming)",
+ "down": {"stall_every_s": 15, "stall_ms": 250, "start_after_s": 5}, "up": {}}

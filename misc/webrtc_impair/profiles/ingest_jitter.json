@@ -1,0 +1,2 @@
+{"_what": "Encoder uplink like tonight's: occasional 200ms TCP stalls (loss+retransmit) and 30ms jitter",
+ "loss": 0.003, "jitter_ms": 30, "delay_ms": 0}

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Logger version="2">
+	<Path>../logs</Path>
+	<Tag name="SRT" level="critical" />
+	<Tag name="HttpServer" level="warn" />
+	<Tag name=".*\.Stat" level="warn" />
+	<Tag name="Transcoder" level="warn" />
+	<Tag name=".*" level="warn" />
+</Logger>

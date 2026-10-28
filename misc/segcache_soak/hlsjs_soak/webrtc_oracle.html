@@ -1,0 +1,185 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebRTC oracle viewer</title>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<audio id="a" autoplay></audio>
+<script type="module">
+// Oracle viewer: what one viewer experiences, recorded for offline judgement (webrtc_oracle.mjs).
+//
+//   assembled  every encoded video frame Chrome completes from RTP (after the depacketizer and
+//              jitter-buffer ordering, before the decoder): wall time, RTP timestamp, type, size.
+//              With capture=1 the bytes too, for a strict offline decode.
+//   presented  every frame the compositor shows (requestVideoFrameCallback), with its RTP
+//              timestamp: freezes, judder and dropped frames are read from these.
+//   stats      getStats() every 200 ms: Chrome's own freeze/NACK/PLI/jitter-buffer counters,
+//              audio concealment, the ICE RTT and both tracks' estimated playout timestamps (A/V sync).
+//   lag        how late this page's own timers ran, so that a freeze the oracle's machine
+//              caused is not blamed on the server.
+//
+// decode=0 attaches no decoder (frames stop at the transform): assembled only, which costs no
+// CPU and is how a 4K rendition is watched on a small machine.
+const params = new URLSearchParams(location.search);
+const wsUrl = params.get('ws');
+const capture = params.get('capture') === '1';
+const decode = params.get('decode') !== '0';
+// transform=0: no encoded transform at all, as for a real viewer. The transform delays frames on their way
+// to Chrome's reference finder while FEC padding notifications are not delayed; in a burst that reorders
+// the two (and its padding stash only reaches 100 sequence numbers back). Without it there is no
+// assembly record and no capture, only what is displayed and the stats.
+const transform = params.get('transform') !== '0';
+
+const out = (window.__ORACLE__ = { state: 'connecting', ice: null, error: null, api: null, assembled: 0, presented: 0, offer: null });
+const t0 = performance.timeOrigin;
+const now = () => t0 + performance.now();  // ms since epoch, sub-ms resolution
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+const queues = { assembled: [], presented: [], stats: [], lag: [] };
+setInterval(() => {
+  for (const [k, q] of Object.entries(queues)) {
+    if (q.length === 0) continue;
+    queues[k] = [];
+    window.__oracleRecords(k, JSON.stringify(q));
+  }
+}, 250);
+
+function onEncoded(frame, controller) {
+  const md = frame.getMetadata ? frame.getMetadata() : {};
+  const rec = { t: now(), rtp: frame.timestamp ?? md.rtpTimestamp, type: frame.type, size: frame.data.byteLength,
+                ssrc: md.synchronizationSource, pt: md.payloadType, w: md.width, h: md.height };
+  if (capture) rec.b64 = toBase64(frame.data);
+  queues.assembled.push(rec);
+  out.assembled++;
+  if (decode) controller.enqueue(frame);
+}
+
+function attachTransform(receiver) {
+  if (typeof receiver.createEncodedStreams !== 'function') {
+    out.error = 'no createEncodedStreams in this Chromium';
+    return;
+  }
+  out.api = 'createEncodedStreams';
+  const { readable, writable } = receiver.createEncodedStreams();
+  readable.pipeThrough(new TransformStream({ transform: onEncoded })).pipeTo(writable).catch((e) => (out.error = 'pipe: ' + e));
+}
+
+const video = document.getElementById('v');
+function onPresented(when, md) {
+  queues.presented.push({ t: now(), when: t0 + when, edt: t0 + md.expectedDisplayTime, n: md.presentedFrames,
+                          rtp: md.rtpTimestamp, recv: md.receiveTime != null ? t0 + md.receiveTime : null,
+                          proc: md.processingDuration, w: md.width, h: md.height });
+  out.presented++;
+  video.requestVideoFrameCallback(onPresented);
+}
+
+// Own timer lateness: a 50 ms interval that fires late means this machine, not the server, stalled.
+let lagExpected = performance.now() + 50;
+setInterval(() => {
+  const t = performance.now();
+  const late = t - lagExpected;
+  lagExpected = t + 50;
+  if (late > 20) queues.lag.push({ t: now(), late_ms: Math.round(late) });
+}, 50);
+
+const VIDEO_FIELDS = ['packetsReceived', 'packetsLost', 'packetsDiscarded', 'framesReceived', 'framesDecoded', 'keyFramesDecoded',
+  'framesDropped', 'framesAssembledFromMultiplePackets', 'freezeCount', 'totalFreezesDuration', 'pauseCount', 'totalPausesDuration',
+  'nackCount', 'pliCount', 'firCount', 'fecPacketsReceived', 'fecPacketsDiscarded', 'retransmittedPacketsReceived',
+  'jitterBufferDelay', 'jitterBufferTargetDelay', 'jitterBufferMinimumDelay', 'jitterBufferEmittedCount', 'jitter',
+  'totalInterFrameDelay', 'totalSquaredInterFrameDelay', 'totalDecodeTime', 'framesPerSecond', 'frameWidth', 'frameHeight',
+  'estimatedPlayoutTimestamp', 'lastPacketReceivedTimestamp', 'bytesReceived', 'decoderImplementation', 'ssrc'];
+const AUDIO_FIELDS = ['packetsReceived', 'packetsLost', 'packetsDiscarded', 'concealedSamples', 'silentConcealedSamples',
+  'concealmentEvents', 'insertedSamplesForDeceleration', 'removedSamplesForAcceleration', 'totalSamplesReceived',
+  'jitterBufferDelay', 'jitterBufferTargetDelay', 'jitterBufferEmittedCount', 'jitter', 'nackCount', 'fecPacketsReceived',
+  'estimatedPlayoutTimestamp', 'lastPacketReceivedTimestamp', 'ssrc'];
+const pick = (s, fields) => Object.fromEntries(fields.filter((f) => s[f] !== undefined).map((f) => [f, s[f]]));
+
+let pc = null;
+setInterval(async () => {
+  if (!pc) return;
+  const rec = { t: now() };
+  const report = await pc.getStats();
+  report.forEach((s) => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') rec.video = pick(s, VIDEO_FIELDS);
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') rec.audio = pick(s, AUDIO_FIELDS);
+    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') {
+      rec.rtt_ms = s.currentRoundTripTime != null ? s.currentRoundTripTime * 1000 : null;
+      rec.avail_out_bps = s.availableIncomingBitrate ?? null;
+    }
+  });
+  // The renderer's own count of frames dropped before display (requestVideoFrameCallback fires at most once
+  // per refresh, so at 60 fps it misses frames that were shown)
+  if (video.getVideoPlaybackQuality) {
+    const q = video.getVideoPlaybackQuality();
+    rec.playback = { total: q.totalVideoFrames, dropped: q.droppedVideoFrames };
+  }
+  queues.stats.push(rec);
+}, 200);
+
+const ws = new WebSocket(wsUrl);
+let sessionId = null;
+let peerId = null;
+ws.onopen = () => ws.send(JSON.stringify({ command: 'request_offer' }));
+ws.onerror = () => { out.error ??= 'websocket error'; };
+ws.onclose = () => { out.ws_closed = now(); if (out.state !== 'playing') out.error ??= 'websocket closed'; };
+ws.onmessage = async (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.error) { out.error = `signalling ${msg.code}: ${msg.error}`; return; }
+  if (msg.command !== 'offer') return;
+  try {
+    sessionId = msg.id;
+    peerId = msg.peer_id;
+    pc = new RTCPeerConnection(transform ? { encodedInsertableStreams: true } : {});
+    const stream = new MediaStream();
+    pc.ontrack = (e) => {
+      if (e.track.kind === 'video') {
+        if (transform) attachTransform(e.receiver);
+        if (decode) {
+          stream.addTrack(e.track);
+          video.srcObject = stream;
+          video.requestVideoFrameCallback(onPresented);
+        }
+      } else {
+        // Audio is played out (at volume 0) so its jitter buffer and concealment run as for a viewer.
+        const audio = document.getElementById('a');
+        audio.srcObject = new MediaStream([e.track]);
+        audio.volume = 0;
+      }
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) ws.send(JSON.stringify({ command: 'candidate', id: sessionId, peer_id: peerId, candidates: [e.candidate] }));
+    };
+    pc.oniceconnectionstatechange = () => { out.ice = pc.iceConnectionState; };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') { out.state = 'playing'; out.connected_at = now(); }
+      if (pc.connectionState === 'failed') {
+        // What each side offered and how far the checks got, before the error ends the recording
+        pc.getStats().then((r) => {
+          out.ice_debug = [...r.values()].filter((s) => /candidate/.test(s.type)).map((s) => ({ type: s.type,
+            address: s.address, port: s.port, protocol: s.protocol, candidateType: s.candidateType, state: s.state,
+            nominated: s.nominated, requestsSent: s.requestsSent, responsesReceived: s.responsesReceived }));
+        }).catch(() => {}).finally(() => { out.error = 'peer connection failed'; });
+      }
+    };
+    out.offer = msg.sdp.sdp;
+    await pc.setRemoteDescription(msg.sdp);
+    out.remote_candidates = msg.candidates ?? [];
+    for (const c of msg.candidates ?? []) await pc.addIceCandidate(c);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ command: 'answer', id: sessionId, peer_id: peerId, sdp: answer }));
+  } catch (e) {
+    out.error = String(e);
+  }
+};
+</script>
+</body>
+</html>

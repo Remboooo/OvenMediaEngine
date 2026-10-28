@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Logger version="2">
+	<Path>../logs</Path>
+	<!-- Session start/stop lines, so a session count that never returns to 0 can be traced. -->
+	<Tag name="Monitor" level="info" />
+	<Tag name="SRT" level="critical" />
+	<Tag name="HttpServer" level="warn" />
+	<Tag name=".*\.Stat" level="warn" />
+	<Tag name="Transcoder" level="warn" />
+	<Tag name=".*" level="warn" />
+</Logger>
