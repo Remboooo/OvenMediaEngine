@@ -1,0 +1,5 @@
+{"_what": "Residential mix: 0.3% loss + rare bursts, 15ms+-8ms jitter, 0.5% reorder, 200ms stall every 40s",
+ "down": {"loss": 0.003, "burst": {"p_enter": 0.0005, "p_exit": 0.2, "loss": 1.0},
+          "delay_ms": 15, "jitter_ms": 8, "reorder": 0.005, "reorder_ms": 25,
+          "stall_every_s": 40, "stall_ms": 200, "start_after_s": 5},
+ "up": {"delay_ms": 15, "jitter_ms": 4, "loss": 0.002}}

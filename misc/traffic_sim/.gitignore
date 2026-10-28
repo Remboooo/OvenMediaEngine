@@ -1,0 +1,6 @@
+logs/
+conf/Server.id
+conf/dumps/
+__pycache__/
+conf_override/
+conf_limits/

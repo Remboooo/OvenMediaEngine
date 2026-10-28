@@ -1,0 +1,2 @@
+{"_what": "15 Mbit bottleneck below the 20 Mbit 4K stream, 150ms drop-tail queue: sustained congestion loss",
+ "down": {"rate_mbps": 15, "queue_ms": 150, "start_after_s": 5}, "up": {}}

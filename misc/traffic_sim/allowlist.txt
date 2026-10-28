@@ -1,0 +1,20 @@
+# Regexes (Python re.search on the full log line) for E/C lines in the sim OME's log
+# that are expected under this traffic and are not server bugs. Keep each one
+# justified: an allow-listed line can't fail a run.
+
+# ffmpeg's FLV muxer sends an empty AAC sequence header before aac_adtstoasc has produced
+# the AudioSpecificConfig; the real one follows. Not seen from real encoders in production.
+AACSpecificConfig .*too small for parsing \(0 must be bigger than 2\)
+MediaRouter .*aac sequence header parsing error
+# A viewer asked for a stream that is offline (zappers and retrying players do this all the time).
+Signalling .*Cannot find stream
+WebRTC Publisher .*Cannot find stream
+LLHLS Publisher .*Cannot find stream
+# The stream stopped between a viewer's offer and its answer; the answer then finds no stream
+# (the WebRTC Publisher line above) and signalling refuses it.
+Signalling .*dispatch command answer for stream .*Forbidden \(403\)
+# 404 for a stream that is offline or just stopped: viewers retrying, and the simulator's own
+# API stats poll racing a stop. (A 404 mid-play on a live stream shows up as a client failure.)
+http_exchange.*\[Response\] 404 Not Found
+# A viewer killed (tab closed) in the middle of a response.
+HTTP\.Server .*Could not send header

@@ -1,0 +1,2 @@
+{"_what": "iid 1% loss downstream: exercises NACK -> RTX (per-session seq remap) and ULPFEC recovery",
+ "down": {"loss": 0.01, "start_after_s": 5}, "up": {}}
