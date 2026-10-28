@@ -6,10 +6,61 @@ This is a personal fork of [OvenMediaEngine](https://github.com/OvenMediaLabs/Ov
 
 ## What this fork adds
 
-* **NVIDIA NVENC / NVDEC** — restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
-* **Scheduled Channel SegmentCache** — for bypass `file://` H.264+AAC MP4 items, indexes samples and can idle-serve HLS/LLHLS without keeping the demux media pump running (near-zero media disk I/O with no WebRTC/OVT viewers). Configure under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
+### WebRTC delivery fixes (always on)
 
-Everything else follows upstream OvenMediaEngine unless noted in the commits on this branch.
+Found and measured with the [pre-release real-world test](misc/README.md) in `misc/`, which plays streams to real Chrome and Firefox through controlled loss, delay, jitter, outages and bottlenecks, and measures frame drops, freezes, delay and memory.
+
+* **Retransmission (`<Rtx>`):**
+  * a late NACK is never answered with the wrong packet (the sent log matched slots, not sequence numbers);
+  * a stale cached copy is never served after the history slot was reused;
+  * every NACKed packet is resent, not only the first;
+  * retransmissions get fresh transport-wide sequence numbers, as in libwebrtc;
+  * packets older than the newest keyframe are not resent once that keyframe has had time to arrive.
+* **ULPFEC (`<Ulpfec>`)** now actually recovers packets: before, browsers recovered none.
+  * The parity covers header extensions as RFC 5109 requires, uses each session's own sequence numbers, is RED-wrapped and follows right behind its frame.
+  * It is encoded on a bounded worker, off the send path (no more crash or memory growth under load).
+  * Lost parity can be retransmitted.
+  * After a slow repair, the sequence numbers Chrome has forgotten as padding are announced again. Without that, a repair on a path with 50 ms or more round trip could freeze the viewer until the next keyframe.
+  * Peers that did not negotiate RED still get plain RTP.
+* **Auto ABR** works. Before, it fell to the lowest rendition within seconds on a clean path and stayed there, because FEC packets read as loss in the transport-wide feedback.
+  * Feedback arrival times are parsed correctly.
+  * Capacity is measured from packet trains.
+  * It settles on the best rendition for the link within seconds, and switches back up after congestion.
+  * REMB is ignored while transport-wide feedback flows (Chrome's REMB forced needless down-switches).
+  * The frame after a switch keyframe is no longer lost.
+* **Several renditions at once** (a 4K passthrough beside a transcoded ladder) no longer freeze each other. Each session has its own send thread, each rendition packetizes on its own worker, and the UDP send buffer is larger.
+* **`<JitterBuffer>`:**
+  * sends frames in decode order (B-frames were sent ahead of their references);
+  * holds each frame from its arrival, so catch-up bursts no longer look like freezes;
+  * releases late frames sooner;
+  * takes its hold range from `<JitterBufferDelay>`.
+* **H.264 over WebRTC:**
+  * access unit delimiters and timing-only SEI are left out (about 7% fewer packets; captions SEI is kept);
+  * a warning is logged once per track with B-frames, which Chrome's software H.264 decoder cannot play.
+* **`?rendition=` signalling query parameter:** start a session on a given rendition ([docs](docs/streaming/webrtc-publishing.md#rendition-query-parameter)).
+
+### Opt-in WebRTC features
+
+Each one helps in some conditions and costs something in others, so each is off by default (upstream behaviour). See [WebRTC Streaming](docs/streaming/webrtc-publishing.md#publisher) for when to use them.
+
+| Setting (under `<Publishers><WebRTC>`) | What it does | Trade-off |
+|---|---|---|
+| `<SendPacing>true</SendPacing>` | Spreads bursts beyond a keyframe (retransmissions after an outage, a backlog after an ingest stall) at 2.5x the media rate, retransmissions first | Behind a 10 Mbps / 100 ms queue: a 1 s outage froze 6.8 s, now 1.0 s. On a path that could take the whole burst, backlogs drain a little slower |
+| `<VideoShedding>true</VideoShedding>` | A congested session that cannot switch down stops video until the next keyframe | A pinned 1080p viewer on a too-narrow link froze 25–28 s, now about 1 s. Each shed costs up to one GOP: only for short GOPs |
+| `<PlayoutDelay><Adaptive>true</Adaptive></PlayoutDelay>` | A session that keeps losing packets on a long path raises its own playout delay to the round trip + 80 ms | 300 ms round trip with 1% loss: about 16 freezes in 30 s, now about 6. Costs that viewer several hundred ms of latency |
+| `<JitterBufferDelay><Min>80</Min></JitterBufferDelay>` | A longer minimum hold for `<JitterBuffer>` (default 20 ms, as upstream) | Soak-tested with several heavy renditions at once; adds 60 ms for every viewer |
+
+### Other additions and fixes
+
+* **NVIDIA NVENC / NVDEC:** restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
+* **Scheduled Channel SegmentCache:** for bypass `file://` H.264+AAC MP4 items, indexes samples and can serve HLS/LLHLS while idle without keeping the demux media pump running (near-zero media disk I/O when no WebRTC/OVT viewers are connected). Configure it under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
+* **Scheduled Channel:** the demux burst stops after idle. SegmentCache's idle HLS keeps its media and discontinuity sequence numbers monotonic across items and file wraps.
+* **HLS / LLHLS:**
+  * spec-valid `TARGETDURATION` and `BANDWIDTH` for SegmentCache playlists;
+  * LLHLS sessions sharing a keep-alive connection no longer leak.
+* **Monitoring:** session counters no longer drift when a stream is deleted while viewers are connected.
+
+Everything else follows upstream OvenMediaEngine.
 
 ## What is OvenMediaEngine?
 <img src="dist/OME_LLHLS_220610.svg" style="max-width: 100%; height: auto;">
@@ -123,6 +174,8 @@ Thank you for your interest in contributing to OvenMediaEngine.
 
 We need your help to keep this project growing. There are many ways to contribute.
 For more information on how to contribute, please see our [Guidelines](CONTRIBUTING.md) and [Rules](CODE_OF_CONDUCT.md).
+
+**In this fork, a change to the media path (WebRTC, RTP/RTCP, the pacer, the transcoder, the providers or LL-HLS) goes through the [pre-release real-world test](misc/README.md) before it is merged:** a smoke test, a 2.5-hour soak with real desktop browsers, and an A/B against the previous build. Put the summaries in the pull request.
 
 - [Finding Bugs](https://github.com/OvenMediaLabs/OvenMediaEngine/blob/master/CONTRIBUTING.md#finding-bugs)
 - [Reviewing Code](https://github.com/OvenMediaLabs/OvenMediaEngine/blob/master/CONTRIBUTING.md#reviewing-code)
