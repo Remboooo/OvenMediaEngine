@@ -348,10 +348,8 @@ namespace mon
 		}
 
 		std::shared_ptr<StreamMetrics> stream_metrics = nullptr;
-		//TODO(Getroot): If a session connects or disconnects at the moment the block below is executed, a race condition may occur, so it must be protected with a mutex.
 		{
 			// If there are sessions in the stream, the number of visitors to the app is recalculated.
-			// Calculate connections to application only if it hasn't origin stream to prevent double subtract.
 			if (stream.IsInputStream())
 			{
 				stream_metrics = app_metrics->GetStreamMetrics(stream);
@@ -360,9 +358,18 @@ namespace mon
 					return false;
 				}
 
-				for (uint8_t type = static_cast<uint8_t>(PublisherType::Unknown); type < static_cast<uint8_t>(PublisherType::NumberOfPublishers); type++)
 				{
-					OnSessionsDisconnected(*stream_metrics, static_cast<PublisherType>(type), stream_metrics->GetConnections(static_cast<PublisherType>(type)));
+					std::lock_guard<std::mutex> lock(_session_guard);
+
+					// The input stream is deleted before its output streams, whose publishers keep reporting
+					// sessions until then. Releasing the output streams here makes those reports count nothing,
+					// and subtracts their sessions from the input stream too, so only its own are left below.
+					for (const auto &output_stream_metric : stream_metrics->GetLinkedOutputStreamMetrics())
+					{
+						ReleaseSessions(output_stream_metric);
+					}
+
+					ReleaseSessions(stream_metrics);
 				}
 
 				SendStreamAlertMessage(alrt::Message::Code::INGRESS_STREAM_DELETED, stream_metrics);
@@ -373,6 +380,12 @@ namespace mon
 				if (output_stream_metric == nullptr)
 				{
 					return false;
+				}
+
+				{
+					// Usually already released with its input stream
+					std::lock_guard<std::mutex> lock(_session_guard);
+					ReleaseSessions(output_stream_metric);
 				}
 
 				// Update module usage count for the tracks in the stream if the stream is an output stream
@@ -505,6 +518,13 @@ namespace mon
 			return;
 		}
 
+		std::lock_guard<std::mutex> lock(_session_guard);
+		if (stream_metric->AreSessionsReleased())
+		{
+			// The stream was deleted, and its sessions were subtracted with it
+			return;
+		}
+
 		server_metric->OnSessionConnected(type);
 		host_metric->OnSessionConnected(type);
 		app_metric->OnSessionConnected(type);
@@ -532,6 +552,13 @@ namespace mon
 		auto stream_metric = app_metric->GetStreamMetrics(stream_info);
 		if (stream_metric == nullptr)
 		{
+			return;
+		}
+
+		std::lock_guard<std::mutex> lock(_session_guard);
+		if (stream_metric->AreSessionsReleased())
+		{
+			// The stream was deleted, and its sessions were subtracted with it
 			return;
 		}
 
@@ -565,10 +592,50 @@ namespace mon
 			return;
 		}
 
+		std::lock_guard<std::mutex> lock(_session_guard);
+		if (stream_metric->AreSessionsReleased())
+		{
+			// The stream was deleted, and its sessions were subtracted with it
+			return;
+		}
+
 		server_metric->OnSessionsDisconnected(type, number_of_sessions);
 		host_metric->OnSessionsDisconnected(type, number_of_sessions);
 		app_metric->OnSessionsDisconnected(type, number_of_sessions);
 		stream_metric->OnSessionsDisconnected(type, number_of_sessions);
+	}
+
+	void Monitoring::ReleaseSessions(const std::shared_ptr<StreamMetrics> &stream_metric)
+	{
+		if (stream_metric->AreSessionsReleased())
+		{
+			return;
+		}
+
+		stream_metric->MarkSessionsReleased();
+
+		auto server_metric = GetServerMetrics();
+		auto app_metric	   = stream_metric->GetApplicationMetrics();
+		auto host_metric   = (app_metric != nullptr) ? app_metric->GetHostMetrics() : nullptr;
+		if ((server_metric == nullptr) || (host_metric == nullptr))
+		{
+			return;
+		}
+
+		for (uint8_t type = static_cast<uint8_t>(PublisherType::Unknown); type < static_cast<uint8_t>(PublisherType::NumberOfPublishers); type++)
+		{
+			const auto publisher_type	  = static_cast<PublisherType>(type);
+			const auto number_of_sessions = stream_metric->GetConnections(publisher_type);
+			if (number_of_sessions == 0)
+			{
+				continue;
+			}
+
+			server_metric->OnSessionsDisconnected(publisher_type, number_of_sessions);
+			host_metric->OnSessionsDisconnected(publisher_type, number_of_sessions);
+			app_metric->OnSessionsDisconnected(publisher_type, number_of_sessions);
+			stream_metric->OnSessionsDisconnected(publisher_type, number_of_sessions);
+		}
 	}
 
 	std::shared_ptr<alrt::Alert> Monitoring::GetAlert()

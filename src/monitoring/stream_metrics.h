@@ -62,7 +62,20 @@ namespace mon
 		void OnSessionDisconnected(PublisherType type) override;
 		void OnSessionsDisconnected(PublisherType type, uint64_t number_of_sessions) override;
 
+		// Set once `Monitoring` has subtracted this stream's sessions on its deletion,
+		// after which session events on it change no count. Guarded by `Monitoring`'s session lock.
+		bool AreSessionsReleased() const
+		{
+			return _are_sessions_released;
+		}
+		void MarkSessionsReleased()
+		{
+			_are_sessions_released = true;
+		}
+
 	private:
+		bool _are_sessions_released = false;
+
 		// Related to origin, From Provider
 		std::atomic<int64_t> _connection_time_to_origin_msec  = 0;
 		std::atomic<int64_t> _subscribe_time_from_origin_msec = 0;

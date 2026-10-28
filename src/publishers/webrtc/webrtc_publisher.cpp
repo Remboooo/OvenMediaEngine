@@ -144,9 +144,11 @@ bool WebRtcPublisher::DisconnectSessionInternal(const std::shared_ptr<RtcSession
 {
 	auto stream = std::dynamic_pointer_cast<RtcStream>(session->GetStream());
 
-	stream->RemoveSession(session->GetId());
-
-	MonitorInstance->OnSessionDisconnected(*stream, PublisherType::Webrtc);
+	// Only the call that removed the session uncounts it: a session can be disconnected more than once
+	if (stream->RemoveSession(session->GetId()))
+	{
+		MonitorInstance->OnSessionDisconnected(*stream, PublisherType::Webrtc);
+	}
 
 	session->Stop();
 
