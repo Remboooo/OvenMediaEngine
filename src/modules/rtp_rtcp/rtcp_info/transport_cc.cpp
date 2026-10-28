@@ -136,7 +136,11 @@ bool TransportCc::Parse(const RtcpPacket &packet)
 		}
 	}
 
-	// Fill received delta info for packet feedbacks
+	// Fill received delta info for packet feedbacks. Each receive delta is relative to the previous
+	// received packet (the first to the reference time), in 250 us ticks: arrival times accumulate.
+	// Taking each delta from the reference time instead put a whole feedback's packets within one
+	// delta of each other, which hid every packet train's spread and bent the delay trend.
+	int64_t arrival_ticks = static_cast<int64_t>(_reference_time) * 64 * 4;
 	for (auto& info : _packet_feedbacks)
 	{
 		int32_t received_delta = 0;
@@ -174,10 +178,11 @@ bool TransportCc::Parse(const RtcpPacket &packet)
 
 		info->_received_delta = received_delta;
 
-		// Calc arrival time in ms
-		int64_t base_time_ms = _reference_time * 64; // reference time is multiples of 64ms
-		int64_t delta_time_ms = received_delta / 4; // received delta is in 1/4000 seconds scale
-		info->_arrival_time_ms = base_time_ms + delta_time_ms;
+		if (info->_received)
+		{
+			arrival_ticks += received_delta;
+			info->_arrival_time_ms = arrival_ticks / 4;
+		}
 	}
 
 	if (offset != payload_size)

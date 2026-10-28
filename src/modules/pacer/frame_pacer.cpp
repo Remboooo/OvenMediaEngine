@@ -210,11 +210,13 @@ void FramePacer::Push(const std::shared_ptr<MediaPacket> &packet,
 			_adaptive_controller->RecordSample(packet->GetTrackId(), lateness_ms);
 		}
 
-		// Hold from arrival by AdaptiveDelay only. DTS-target pacing scheduled
-		// after_ms = delay + N*frame_period during catch-up bursts, which
-		// Chrome reports as freezeEvents with packetsLost=0. Recording
-		// lateness still feeds AdaptiveDelay; release spacing is wall-clock.
-		after_ms = static_cast<int>(effective_delay_ms);
+		// Release at the DTS target, but never later than arrival + delay.
+		// A late frame is held only for what is left of its delay, so source
+		// arrival jitter up to the delay is absorbed instead of passed on.
+		// The cap keeps the hold from growing: uncapped DTS-target pacing
+		// scheduled after_ms = delay + N*frame_period during catch-up bursts,
+		// which Chrome reports as freezeEvents with packetsLost=0.
+		after_ms = static_cast<int>(std::clamp<int64_t>(delta_ms, 0, effective_delay_ms));
 		} // effective_delay_ms > 0, continuing after idle/first-frame branch
 	}
 

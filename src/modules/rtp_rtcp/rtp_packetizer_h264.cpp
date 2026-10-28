@@ -37,6 +37,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtp_packetizer_h264.h"
 #include "base/ovlibrary/byte_io.h"
 
+#include <cstdlib>
+#include <string>
+
 RtpPacketizerH264::RtpPacketizerH264()
 	: _num_packets_left(0)
 {
@@ -53,11 +56,21 @@ size_t RtpPacketizerH264::SetPayloadData(size_t max_payload_len, size_t last_pac
 	_last_packet_reduction_len = last_packet_reduction_len;
 	_packetization_mode = rtp_type_header->h26X.packetization_mode;
 
+	// OME_TEST_KEEP_AUD_SEI=1 sends them anyway, to compare
+	static const bool keep_all = std::getenv("OME_TEST_KEEP_AUD_SEI") != nullptr && std::string(std::getenv("OME_TEST_KEEP_AUD_SEI")) == "1";
 	for(size_t i = 0; i < fragmentation->GetCount(); ++i) 
 	{
 		const uint8_t* buffer = &payload_data[fragmentation->fragmentation_offset[i]];
 		size_t length = fragmentation->fragmentation_length[i];
+		if (keep_all == false && IsDispensableNalUnit(buffer, length))
+		{
+			continue;
+		}
 		_input_fragments.push_back(Fragment(buffer, length));
+	}
+	if (_input_fragments.empty())
+	{
+		return 0;
 	}
 
 	if(!GeneratePackets()) 
@@ -70,6 +83,70 @@ size_t RtpPacketizerH264::SetPayloadData(size_t max_payload_len, size_t last_pac
 		return 0;
 	}
 	return _num_packets_left;
+}
+
+bool RtpPacketizerH264::IsDispensableNalUnit(const uint8_t* nal, size_t length)
+{
+	if (length < 1)
+	{
+		return false;
+	}
+	const uint8_t type = nal[0] & 0x1F;
+	if (type == 9)  // access unit delimiter
+	{
+		return true;
+	}
+	if (type != 6)  // SEI
+	{
+		return false;
+	}
+	// sei_message()s up to the RBSP trailing bits. A payload's bytes are not unescaped (emulation
+	// prevention): a message that does not parse cleanly keeps the NAL unit.
+	size_t i = 1;
+	bool any = false;
+	while (i < length && nal[i] != 0x80)
+	{
+		size_t payload_type = 0, payload_size = 0;
+		while (i < length && nal[i] == 0xFF)
+		{
+			payload_type += 255;
+			i++;
+		}
+		if (i >= length)
+		{
+			return false;
+		}
+		payload_type += nal[i++];
+		while (i < length && nal[i] == 0xFF)
+		{
+			payload_size += 255;
+			i++;
+		}
+		if (i >= length)
+		{
+			return false;
+		}
+		payload_size += nal[i++];
+		if (payload_type > 1 || i + payload_size > length)
+		{
+			return false;
+		}
+		i += payload_size;
+		any = true;
+	}
+	if (any == false || i >= length)
+	{
+		return false;
+	}
+	// After the trailing bits only zeros (a 4-byte start code's first byte can end up here)
+	for (i++; i < length; i++)
+	{
+		if (nal[i] != 0)
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 bool RtpPacketizerH264::GeneratePackets() 

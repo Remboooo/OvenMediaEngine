@@ -152,3 +152,49 @@ TEST_F(FramePacerTest, DispatchIsDelayedByPacerDelay)
 	EXPECT_GE(elapsed_ms, 40);
 	EXPECT_LT(elapsed_ms, 500);
 }
+
+// A frame that arrives late (and the frames queued behind it) is held only for
+// what is left of its delay, so it leaves on its DTS cadence: the source's
+// arrival jitter is absorbed rather than passed on to the viewer.
+TEST_F(FramePacerTest, LateFramesLeaveOnDtsCadence)
+{
+	constexpr int kFrames	   = 120;
+	constexpr int kSteadyFrames = 40;  // on cadence, so the anchor calibrates first
+	std::mutex mutex;
+	std::vector<std::chrono::steady_clock::time_point> sent(kFrames);
+	int sent_count = 0;
+	std::condition_variable cv;
+
+	FramePacer pacer("test/jitter", 1, kTimebaseDen, 50);
+	pacer.Init(_scheduler, [&](const std::shared_ptr<MediaPacket> &p) {
+		std::lock_guard<std::mutex> lock(mutex);
+		sent[p->GetDts() / kFrameDuration] = std::chrono::steady_clock::now();
+		sent_count++;
+		cv.notify_all();
+	});
+
+	auto frame_time = [](int i) { return std::chrono::microseconds(i * kFrameDuration * 1000000 / kTimebaseDen); };
+	auto start		= std::chrono::steady_clock::now();
+	auto arrival	= start;
+	for (int i = 0; i < kFrames; i++)
+	{
+		// Every 8th frame after the steady part is 30 ms late; the frames behind
+		// it can't overtake it, so they arrive in a burst with it.
+		auto late = (i >= kSteadyFrames && i % 8 == 0) ? std::chrono::milliseconds(30) : std::chrono::milliseconds(0);
+		arrival	  = std::max(arrival, start + frame_time(i) + late);
+		std::this_thread::sleep_until(arrival);
+		pacer.Push(MakeVideoPacket(i * kFrameDuration, i * kFrameDuration, i == 0), std::chrono::steady_clock::now());
+	}
+
+	std::unique_lock<std::mutex> lock(mutex);
+	ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return sent_count == kFrames; }));
+	int64_t lo = INT64_MAX, hi = INT64_MIN;
+	for (int i = kSteadyFrames; i < kFrames; i++)
+	{
+		auto offset_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sent[i] - (start + frame_time(i))).count();
+		lo			   = std::min(lo, offset_ms);
+		hi			   = std::max(hi, offset_ms);
+	}
+	// Released at arrival + 50 ms, the late frames would trail by 30 ms
+	EXPECT_LT(hi - lo, 15) << "send offset vs DTS ranges " << lo << ".." << hi << " ms";
+}

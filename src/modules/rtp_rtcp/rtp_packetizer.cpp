@@ -151,6 +151,9 @@ bool RtpPacketizer::PacketizeVideo(cmn::MediaCodecId video_type,
 	std::shared_ptr<RtpPacket> rtp_header_template, red_rtp_header_template;
 	std::shared_ptr<RtpPacket> last_rtp_header, last_red_rtp_header;
 
+	// Parity for earlier frames goes out before this frame's media is numbered.
+	EmitReadyFec();
+
 	rtp_header_template = AllocatePacket();
 	rtp_header_template->SetTimestamp(rtp_timestamp);
 
@@ -257,48 +260,94 @@ bool RtpPacketizer::GenerateRedAndFecPackets(const std::shared_ptr<RtpPacket> &p
 	// Because FEC packet should not affect the sequence number of the RTP packet.
 	AssignSequenceNumber(red_packet.get(), true);
 
+	// The parity is computed on a copy: sessions stamp their own extension values on the packets they send
 	if (_ulpfec_generate_fec)
 	{
-		_ulpfec_generator.AddMediaPacket(packet, red_packet->SequenceNumber());
+		if (packet->IsFirstPacketOfFrame())
+		{
+			// A frame that never reached its last packet is left unprotected
+			_ulpfec_frame_packets.clear();
+		}
+		_ulpfec_frame_packets.push_back({std::make_shared<const RtpPacket>(*packet), red_packet->SequenceNumber()});
 	}
 
 	// Adjust completed red packet's payload offset and size for RTX packet
 	red_packet->PackageAsRtp();
 	_stream->OnRtpPacketized(red_packet);
 
-	if (_ulpfec_generate_fec == false || _ulpfec_generator.IsAvailableFecPackets() == false)
+	// Encode/XOR of a 4K keyframe used to run inline on the packetize thread
+	// at the frame's last packet and HOL-stall the next frame (>=200ms Chrome gaps,
+	// packetsLost=0). Media RED is already on the wire above; the frame's
+	// copies go to this packetizer's single Encode worker. Its parity is
+	// emitted right behind the frame when the worker finishes within
+	// kFecEmitWait (the usual case), else at the next frame boundary.
+	//
+	// Parity a frame late carries that frame's (older) RTP timestamp beside the
+	// next frame's media: Chrome then measured 33 ms of RTP jitter on a clean
+	// path, and on a real desktop (GPU decode, real display) showed ~24 of 30
+	// fps. With ULPFEC off, or parity right behind its frame: 2 ms, ~30 fps.
+	if (_ulpfec_generate_fec == false || packet->IsLastPacketOfFrame() == false)
 	{
 		return true;
 	}
 
-	// FEC packets go with their frame (track, timestamps, the extensions a session stamps) but mark no frame boundary
-	_framemarking_extension->Reset();
-
-	auto fec_header = AllocatePacket();
-	fec_header->SetTimestamp(packet->Timestamp());
-	fec_header->SetNTPTimestamp(packet->NTPTimestamp());
-	fec_header->SetTrackId(_track_id);
-	fec_header->SetVideoPacket(true);
-	fec_header->SetExtensions(_rtp_extensions);
-
-	while (_ulpfec_generator.IsAvailableFecPackets())
+	if (_ulpfec_worker == nullptr)
 	{
-		auto fec_packet = std::make_shared<RedRtpPacket>(_red_payload_type, _ulpfec_payload_type, *fec_header);
-		fec_packet->SetUlpfec(true, _payload_type);
+		_ulpfec_worker = std::make_unique<UlpfecEncodeWorker>(ov::String::FormatString("RtcFec%u", _track_id).CStr());
+	}
+	_ulpfec_worker->Submit(packet->Timestamp(), packet->NTPTimestamp(), std::move(_ulpfec_frame_packets));
+	_ulpfec_frame_packets.clear();
+	if (_ulpfec_worker->WaitIdle(kFecEmitWait))
+	{
+		EmitReadyFec();
+	}
 
-		if (_ulpfec_generator.NextPacket(fec_packet.get()) == false)
+	return true;
+}
+
+void RtpPacketizer::EmitReadyFec()
+{
+	if (_ulpfec_worker == nullptr)
+	{
+		return;
+	}
+
+	// Runs on the packetize thread between frames, so parity never takes RED
+	// sequence numbers in the middle of a frame
+	for (auto &result : _ulpfec_worker->TakeResults())
+	{
+		if (result.generator->IsAvailableFecPackets() == false)
 		{
 			continue;
 		}
 
-		AssignSequenceNumber(fec_packet.get(), true);
-		fec_packet->PackageAsRtp();
+		// FEC packets go with their frame (track, timestamps, the extensions a session stamps) but mark no frame boundary
+		_framemarking_extension->Reset();
 
-		_rtp_packet_count++;
-		_stream->OnRtpPacketized(fec_packet);
+		auto fec_header = AllocatePacket();
+		fec_header->SetTimestamp(result.timestamp);
+		fec_header->SetNTPTimestamp(result.ntp_timestamp);
+		fec_header->SetTrackId(_track_id);
+		fec_header->SetVideoPacket(true);
+		fec_header->SetExtensions(_rtp_extensions);
+
+		while (result.generator->IsAvailableFecPackets())
+		{
+			auto fec_packet = std::make_shared<RedRtpPacket>(_red_payload_type, _ulpfec_payload_type, *fec_header);
+			fec_packet->SetUlpfec(true, _payload_type);
+
+			if (result.generator->NextPacket(fec_packet.get()) == false)
+			{
+				continue;
+			}
+
+			AssignSequenceNumber(fec_packet.get(), true);
+			fec_packet->PackageAsRtp();
+
+			_rtp_packet_count++;
+			_stream->OnRtpPacketized(fec_packet);
+		}
 	}
-
-	return true;
 }
 
 bool RtpPacketizer::PacketizeAudio(FrameType frame_type,

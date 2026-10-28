@@ -21,10 +21,11 @@
 //
 // Schedules each frame's dispatch on a shared ov::DelayQueue. Frames may
 // arrive in bursts; without smoothing, players render at the burst rate.
-// Release is a fixed hold from wall-clock arrival:
-//   after_ms = current AdaptiveDelay (or fallback)
-// DTS is still tracked so AdaptiveDelay can record lateness and so drift
-// resets keep the anchor sane, but after_ms is NOT DTS-target pacing.
+// Release is at the DTS target (anchor + DTS + AdaptiveDelay), capped at a
+// hold of the current AdaptiveDelay from wall-clock arrival:
+//   after_ms = clamp(target - arrival, 0, delay)
+// so a late frame waits only for the rest of its delay and source arrival
+// jitter up to the delay does not reach the viewer. The cap matters: uncapped
 // DTS-ahead scheduling (after_ms = delay + N*frame_period during catch-up)
 // produced Chrome freezeEvents with packetsLost=0 under 4K+ULPFEC.
 //

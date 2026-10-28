@@ -130,28 +130,99 @@ Configure `<WebRTC>` under `<Publishers>` in the Application settings:
         <Rtx>false</Rtx>
         <Ulpfec>false</Ulpfec>
         <JitterBuffer>true</JitterBuffer>
+        <JitterBufferDelay>
+            <Min>20</Min>
+            <Max>500</Max>
+        </JitterBufferDelay>
         <PlayoutDelay>
             <Min>0</Min>
             <Max>0</Max>
+            <Adaptive>false</Adaptive>
         </PlayoutDelay>
+        <SendPacing>false</SendPacing>
+        <VideoShedding>false</VideoShedding>
     </WebRTC>
     ...
 </Publishers>
 ```
 
-<table><thead><tr><th width="189">Option</th><th width="433.33333333333326">Description</th><th>Default</th></tr></thead><tbody><tr><td>`Timeout`</td><td>ICE (STUN request/response) timeout as milliseconds, if there is no request or response during this time, the session is terminated.</td><td>`30000`</td></tr><tr><td>`Rtx`</td><td>WebRTC retransmission, a useful option in WebRTC/udp, but ineffective in WebRTC/tcp.</td><td>`false`</td></tr><tr><td>`Ulpfec`</td><td>WebRTC forward error correction, a useful option in WebRTC/udp, but ineffective in WebRTC/tcp.</td><td>`false`</td></tr><tr><td>`JitterBuffer`</td><td>Smooths bursty frame delivery by spacing media frames according to their PTS. See below for details.</td><td>`false`</td></tr><tr><td>`PlayoutDelay`</td><td>Hints the minimum and maximum playout delay (in milliseconds, from 0 to 40950) to the player so it keeps a deeper jitter buffer for video. Useful when the network introduces bursty latency and the default low-latency buffer causes hitches. See below for details.</td><td>`Disabled`</td></tr><tr><td>`BandwidthEstimation`</td><td><p>Determines which method OvenMediaEngine uses to estimate the bandwidth of the connected player. This bandwidth estimation is required for WebRTC ABR when OME selects and sends an appropriate rendition to the player.</p><p>If <strong>TransportCC</strong> or <strong>REMB</strong> is set, only one method is used. If the default value <strong>All</strong> is set, both methods are included in the SDP offer, and the player operates according to its preference. Most modern browsers use Transport-cc by default in this case. Transport-cc provides more accurate bandwidth estimation.</p></td><td>`All`</td></tr></tbody></table>
+<table><thead><tr><th width="189">Option</th><th width="433.33333333333326">Description</th><th>Default</th></tr></thead><tbody><tr><td>`Timeout`</td><td>ICE (STUN request/response) timeout as milliseconds, if there is no request or response during this time, the session is terminated.</td><td>`30000`</td></tr><tr><td>`Rtx`</td><td>WebRTC retransmission, a useful option in WebRTC/udp, but ineffective in WebRTC/tcp.</td><td>`false`</td></tr><tr><td>`Ulpfec`</td><td>WebRTC forward error correction, a useful option in WebRTC/udp, but ineffective in WebRTC/tcp.</td><td>`false`</td></tr><tr><td>`JitterBuffer`</td><td>Smooths bursty frame delivery by spacing media frames according to their decode timestamps. See below for details.</td><td>`false`</td></tr><tr><td>`JitterBufferDelay`</td><td>The hold range of `JitterBuffer` in milliseconds (`Min` to `Max`). See below for details.</td><td>`20` to `500`</td></tr><tr><td>`PlayoutDelay`</td><td>Hints the minimum and maximum playout delay (in milliseconds, from 0 to 40950) to the player so it keeps a deeper jitter buffer for video. Useful when the network introduces bursty latency and the default low-latency buffer causes hitches. With `<Adaptive>true</Adaptive>`, each session raises its own minimum on a long, lossy path. See below for details.</td><td>`Disabled`</td></tr><tr><td>`SendPacing`</td><td>Spreads bursts larger than a keyframe (a retransmission storm after an outage, a backlog after an ingest stall) at 2.5x the session's media rate. See below for details.</td><td>`false`</td></tr><tr><td>`VideoShedding`</td><td>Stops a congested session's video until the next keyframe when it cannot switch to a lower rendition. See below for details.</td><td>`false`</td></tr><tr><td>`BandwidthEstimation`</td><td><p>Determines which method OvenMediaEngine uses to estimate the bandwidth of the connected player. This bandwidth estimation is required for WebRTC ABR when OME selects and sends an appropriate rendition to the player.</p><p>If <strong>TransportCC</strong> or <strong>REMB</strong> is set, only one method is used. If the default value <strong>All</strong> is set, both methods are included in the SDP offer, and the player operates according to its preference. Most modern browsers use Transport-cc by default in this case. Transport-cc provides more accurate bandwidth estimation.</p></td><td>`All`</td></tr></tbody></table>
 
 #### JitterBuffer
 
 Without the jitter buffer, frames are forwarded to the player as soon as they arrive from the Provider. Any timing jitter introduced upstream (network jitter, encoder bursts, ingest pacing, and so on) is passed straight through to the player, which can result in uneven playback.
 
-When the jitter buffer is enabled, OvenMediaEngine evens out the spacing between frames before sending. The player receives a steady stream and playback runs at a consistent speed. In a healthy environment where upstream jitter is already low, the added latency is negligible.
+When the jitter buffer is enabled, OvenMediaEngine evens out the spacing between frames before sending. The player receives a steady stream and playback runs at a consistent speed. Frames always leave in decode order, so streams with B-frames are not reordered.
+
+Each frame is held at least `<JitterBufferDelay><Min>` after it arrived. A frame that arrives late waits only for what is left of its delay. The hold adapts up to `<Max>` when the source's arrival jitter needs it. In a healthy environment where upstream jitter is already low, the added latency is about `<Min>`.
+
+* **Default `20` to `500`:** the lowest latency, as upstream OvenMediaEngine.
+* **`80` to `500`:** what this fork was soak-tested with for several heavy renditions played at once on one server (a 4K passthrough with ULPFEC beside a transcoded ladder): no freezes. The 20 ms minimum was not retested in that setup after the related send-path fixes. Try 80 if viewers of such a server show short freezes without packet loss. It adds 60 ms for every viewer. To measure the effect of this and the other options on your own setup, see the fork's pre-release real-world test (`misc/README.md` in the source tree).
 
 #### PlayoutDelay
 
 `<PlayoutDelay>` asks the player to hold incoming video for at least `<Min>` and at most `<Max>` milliseconds before rendering. A larger minimum gives the player a deeper buffer to absorb network jitter, at the cost of higher end-to-end latency. Both values must be between `0` and `40950`. Omit the `<PlayoutDelay>` element to leave playout timing entirely up to the player.
 
 The hint applies to video only. With a non-trivial `<Min>`, audio may briefly play ahead of video for a few seconds at session start, until the player aligns the two streams. If this initial offset is undesirable, lower `<Min>` or omit `<PlayoutDelay>`.
+
+A `<Min>` of `0` with `<Max>` up to `500` puts Chrome in its "render as soon as possible" mode: frames are shown on arrival with almost no slack, and small timing variations drop frames at the display. A `<Min>` of about `50` avoids that for about 30 ms of extra delay.
+
+##### Adaptive
+
+`<Adaptive>true</Adaptive>` lets each session raise its own minimum when its viewer keeps losing packets on a long path. A retransmission takes about one round trip. Once that is longer than the player buffers by itself, every packet that needs one freezes the picture.
+
+* **When it raises the delay:** the viewer sent retransmission requests in at least 5 different seconds out of the last 10, and the path's base round trip (measured from transport-wide feedback, without its queues) is over 100 ms.
+* **What it sets:** the minimum becomes the base round trip + 80 ms (at most 1500 ms), and the maximum stays at least 200 ms above it.
+* **When it comes back down:** after 60 s without retransmission requests, at 20 ms per second, slowly enough for the player's audio sync to follow.
+* **Other sessions:** short and clean paths keep the configured delay.
+
+Measured at 300 ms round trip with 1% loss and `50`:`200`, with Chrome: freezes went from about 16 to about 6 in 30 s, and dropped frames from 14–18% to 1–5%. That viewer's delay rose to about 390 ms. A 1 s outage, a loss burst or a bottleneck does not raise it.
+
+* **Use it** when some viewers are far away (another continent, satellite, mobile) and smooth playback matters more to them than the last few hundred milliseconds.
+* **Leave it off** when latency is the point (auctions, betting, two-way talk). A viewer's delay may rise to several hundred milliseconds and stay there for at least a minute after the loss stops.
+* **Requirements:** `<Min>` and `<Max>` set, the player accepting the playout-delay RTP extension, and transport-wide congestion control (`BandwidthEstimation` `TransportCC` or `All`).
+
+#### SendPacing
+
+Without pacing, each session sends whatever is ready at once. After an outage the player asks for every lost packet in one go (hundreds of retransmissions per second of outage), and after an ingest stall the backlog is released at network speed. A link with a small queue in front of the viewer (Wi-Fi, mobile, DSL, a shaped uplink) drops much of such a burst. A retransmission lost that way may arrive too late, and the player then waits for the next keyframe.
+
+With `<SendPacing>true</SendPacing>`, each session paces what it sends:
+
+* **Bursts up to the size of the largest keyframe** (with its parity, at least 64 KB) still go out at once, as before.
+* **Anything beyond** is sent at 2.5x the session's media rate, and never below 2.5x the rendition's bitrate.
+* **Retransmissions** go ahead of queued media, limited to the media rate.
+
+Measured behind a 10 Mbps link with a 100 ms drop-tail queue:
+
+| Event | Without pacing | With pacing |
+|---|---|---|
+| 1 s outage | 6.8 s frozen, 3 keyframe requests | 1.0 s, none |
+| 2 s outage | 6.1 s | 2.4 s |
+| 2 s ingest stall | 6.1 s | 1.95 s |
+
+The link dropped 20–627 packets per event without pacing and none with it. Random loss and long round trips were unaffected.
+
+* **Use it** when viewers can be behind a link with a small queue, which is most viewers on the internet.
+* **The cost:** on a path that could take the whole burst, a backlog takes a little longer to drain (at 2.5x the media rate instead of line rate). Retransmissions beyond the media rate are not sent; the player asks again.
+
+#### VideoShedding
+
+A viewer who cannot switch to a lower rendition freezes for as long as the link carries less than the rendition's bitrate. This is a viewer pinned with [`?rendition`](webrtc-publishing.md#rendition-query-parameter), on a playlist without ABR, or already on the lowest rung of an ABR playlist. The link drops packets of every frame, retransmissions compete with new media, and each broken frame stalls the rest of its GOP.
+
+With `<VideoShedding>true</VideoShedding>`, such a session stops its video at the next frame once all of these hold, and resumes at the next keyframe:
+
+* the queue in front of the viewer exceeds 200 ms;
+* that queue is still growing, or more than 5% of packets are lost;
+* the link's measured capacity is below the stream's rate, or not yet known.
+
+Audio continues. Skipped frames are never numbered, so the player sees no gap and requests nothing. A sudden longer path (jitter, a route change) also looks like a growing queue. It is told apart because its packets arrive bunched instead of spread at a narrow link's rate.
+
+Measured with a 1080p rendition pinned behind a link at 0.5–1.0x its bitrate (300 ms drop-tail queue): the longest freeze went from 25–28.7 s to about 1 s, and retransmission requests from 2,300–3,200 to 1–65.
+
+* **Use it** with short GOPs (1–2 s), when viewers pin a rendition or a playlist has no lower rung.
+* **Little gain with long GOPs.** Each shed costs up to one GOP of video. With an 8 s GOP, a link at 0.8x the bitrate froze about 30 s of 30 either way (shedding still cut the link's packet drops from about 8,000 to about 500).
+* **With auto ABR,** a session switches down instead and sheds only on the lowest rung.
+* **Requirements:** transport-wide congestion control (`BandwidthEstimation` `TransportCC` or `All`). Without it, shedding never triggers.
 
 ### Encoding
 
