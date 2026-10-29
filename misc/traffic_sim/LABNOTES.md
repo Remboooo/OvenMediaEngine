@@ -440,3 +440,23 @@ Smoke ×5 vs capped ×5 (`cmp_early_r*`, `cmp_capped_r*`; capped r5 rerun in the
   Desktop table like `release_soak`: Firefox fiber/residential 0.00..0.88 freezes/min, Chrome fiber 0.07..0.36,
   Chrome residential 1.19 (desktop A) / 3.06 (desktop B). Residential WARNs: two 8 s freezes on s720 (8 s GOP, no
   PLI answer: known) and 2..4 s on s1080 (B-frames: known). Desktop A Firefox wifi drops 32.7% again (not the build).
+
+## 2026-10-29
+
+- **Chrome freezes on a live 1080p60 passthrough (remote OBS over SRT), one viewer, Chrome 156 with D3D11
+  hardware decode on an RTX 3070:** 1.4–3.9 s about once a minute, zero loss and zero NACKs, many PLIs. Not OME:
+  a local per-frame probe (60.0 fps, no gaps, worst frame 59 ms late) and an H.264 dump of what OME sent (FFmpeg
+  decodes the exact stalled GOPs without an error) were clean. Chrome's own log (`--enable-logging
+  --vmodule=generic_decoder=1,video_receive_stream2=1,...`) showed the mechanism: "Too many frames backed up in the
+  decoder" for ~3 s, then "Failed to decode frame. Return code: -1", a decoder reset and a wait for the next
+  keyframe (OME ignores PLI). Cause: the web player's WebGL effects, which hide the `<video>`
+  (`visibility: hidden`) and copied it into a texture; with the effects off the hang lines went from 67–835/min to
+  0. Copying once per decoded frame did not help; leaving the `<video>` visible did (pliCount flat) but looked
+  jittery. Fixed in the player: WebRTC frames straight from the track (MediaStreamTrackProcessor), paced onto a
+  steady timeline and closed right after drawing: no hangs, no jitter. **DONE** (player side). Lesson: for Chrome
+  freezes with zero loss, get Chrome's log before suspecting OME.
+- Side finding: OME put the framemarking extension (ID 1) on every video packet although no browser negotiates
+  it; Chrome logged "Unidentified extension in the packet" for every RED packet (from `ZeroMutableExtensions` in
+  its ULPFEC receiver). Removed from the SDP offer and the packets; OvenRtcTester now finds keyframes in the H.264
+  payload. Harness smoke PASS on all 6 profiles (`webrtc_impair/logs/smoke_20261029_233236`, headless viewers only:
+  the desktop browsers were not reachable). **DONE.**

@@ -9,6 +9,7 @@
 //          - ULPFEC parity is computed over the media packet after its fixed header:
 //            extensions and payload, RED header excluded; every protected packet recovers
 //          - RTX of a RED packet carries [OSN][RED header][media payload]
+//          - video packets carry only the extensions the stream enabled (no framemarking)
 //
 //==============================================================================
 #include <gtest/gtest.h>
@@ -509,4 +510,39 @@ TEST(RtpPacketizerUlpfec, RtxOfRedPacketKeepsRedHeaderAfterOsn)
 		checked++;
 	}
 	EXPECT_GT(checked, 0u);
+}
+
+// No browser negotiates framemarking, and an extension the answer leaves out must not go on the
+// wire (Chrome logged "Unidentified extension" for every RED packet). Only what the stream enabled.
+TEST(RtpPacketizer, VideoPacketsCarryOnlyEnabledExtensions)
+{
+	auto stream = std::make_shared<CapturingStream>();
+	{
+		RtpPacketizer packetizer(stream);
+		packetizer.SetCodec(cmn::MediaCodecId::H264);
+		packetizer.SetPayloadType(kMediaPt);
+		packetizer.SetTrackId(kTrackId);
+		packetizer.SetSSRC(0x1234);
+		packetizer.EnableTransportCc(0);
+
+		RTPVideoHeader video_header{};
+		video_header.codec = cmn::MediaCodecId::H264;
+		video_header.codec_header.h26X.packetization_mode = H26XPacketizationMode::NonInterleaved;
+
+		std::vector<uint8_t> nal(5000, 0x11);
+		nal[0] = 0x65;
+		FragmentationHeader frag;
+		frag.fragmentation_offset.push_back(0);
+		frag.fragmentation_length.push_back(nal.size());
+		ASSERT_TRUE(packetizer.Packetize(FrameType::VideoFrameKey, 1500, 0, nal.data(), nal.size(), &frag, &video_header));
+	}
+
+	ASSERT_GT(stream->packets.size(), 1u);
+	for (const auto &p : stream->packets)
+	{
+		// Parse the wire bytes, as a receiver does
+		RtpPacket parsed(p->GetData());
+		EXPECT_FALSE(parsed.GetExtension(RTP_HEADER_EXTENSION_FRAMEMARKING_ID).has_value());
+		EXPECT_TRUE(parsed.GetExtension(RTP_HEADER_EXTENSION_TRANSPORT_CC_ID).has_value());
+	}
 }

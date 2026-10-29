@@ -543,6 +543,7 @@ func (c *omeClient) run(url string) error {
 		}()
 
 		prev_seq := uint16(0)
+		frameIsKey := false
 		startTimestamp := uint32(0)
 		last_report_time := time.Now().AddDate(0, 0, -1)
 
@@ -575,16 +576,25 @@ func (c *omeClient) run(url string) error {
 
 			switch track.Kind() {
 			case webrtc.RTPCodecTypeVideo:
+				// H.264 IDR in any packet of the frame (single NAL, STAP-A, FU-A start). OME no longer
+				// sends the framemarking extension this used to read: no browser negotiates it.
+				if p := rtp.Payload; len(p) > 1 {
+					switch nalType := p[0] & 0x1f; {
+					case nalType == 5:
+						frameIsKey = true
+					case nalType == 24 && len(p) > 3 && p[3]&0x1f == 5:
+						frameIsKey = true
+					case nalType == 28 && p[1]&0x80 != 0 && p[1]&0x1f == 5:
+						frameIsKey = true
+					}
+				}
 				if rtp.Marker {
 					c.stat.totalVideoFrames++
 
-					framemarking := rtp.GetExtension(1)
-					if len(framemarking) > 0 {
-						// Start && Keyframe
-						if uint8(framemarking[0]) & 0x20 != 0 {
-							c.stat.totalVideoKeyframes++
-						}
+					if frameIsKey {
+						c.stat.totalVideoKeyframes++
 					}
+					frameIsKey = false
 
 					c.stat.videoRtpTimestampElapsedMSec = int64((float64(rtp.Timestamp-startTimestamp) / float64(track.Codec().ClockRate) * 1000))
 

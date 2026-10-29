@@ -12,7 +12,6 @@
 #include <thread>
 
 #include "rtp_header_extension/rtp_header_extensions.h"
-#include "rtp_header_extension/rtp_header_extension_framemarking.h"
 #include "rtp_header_extension/rtp_header_extension_playout_delay.h"
 #include "rtp_header_extension/rtp_header_extension_transport_cc.h"
 #include "rtp_header_extension/rtp_header_extension_abs_send_time.h"
@@ -113,7 +112,6 @@ private:
 	uint64_t		_rtp_packet_count = 0;
 
 	RtpHeaderExtensions _rtp_extensions;
-	std::shared_ptr<RtpHeaderExtensionFrameMarking>	_framemarking_extension;
 	std::shared_ptr<RtpHeaderExtensionPlayoutDelay> _playout_delay_extension;
 	std::shared_ptr<RtpHeaderExtensionTransportCc> _transport_cc_extension;
 	std::shared_ptr<RtpHeaderExtensionAbsSendTime> _abs_send_time_extension;

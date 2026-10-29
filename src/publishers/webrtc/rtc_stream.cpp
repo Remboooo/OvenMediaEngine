@@ -15,7 +15,6 @@
 #include <modules/bitstream/h264/h264_decoder_configuration_record.h>
 #include <modules/bitstream/nalu/nal_stream_converter.h>
 #include <modules/rtp_rtcp/rtp_header_extension/rtp_header_extension_abs_send_time.h>
-#include <modules/rtp_rtcp/rtp_header_extension/rtp_header_extension_framemarking.h>
 #include <modules/rtp_rtcp/rtp_header_extension/rtp_header_extension_playout_delay.h>
 
 #include "rtc_application.h"
@@ -53,7 +52,6 @@ a=mid:ifUNok
 a=setup:actpass
 a=rtcp-mux
 a=msid:a6Dt3TF7zAXnsj0SECUobPQNRvhH2r5YqieJ aSo7tDegF8TYyC6U2NR9qM5vm1dQrGjZBuVL
-a=extmap:1 urn:ietf:params:rtp-hdrext:framemarking
 a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01
 a=rtpmap:98 H264/90000
 a=fmtp:98 packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1
@@ -741,7 +739,9 @@ std::shared_ptr<MediaDescription> RtcStream::MakeVideoDescription() const
 	{
 		video_media_desc->SetRtxSsrc(_video_rtx_ssrc);
 	}
-	video_media_desc->AddExtmap(RTP_HEADER_EXTENSION_FRAMEMARKING_ID, RTP_HEADER_EXTENSION_FRAMEMARKING_ATTRIBUTE);
+	// No framemarking (draft-ietf-avtext-framemarking, expired): no browser negotiates it, and an
+	// extension the answer leaves out still went on every video packet ("Unidentified extension" in
+	// Chrome's log for every RED packet).
 
 	// Experimental Code
 	if (_playout_delay_enabled == true)
