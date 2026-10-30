@@ -6,9 +6,28 @@ This is a personal fork of [OvenMediaEngine](https://github.com/OvenMediaLabs/Ov
 
 ## What this fork adds
 
-### WebRTC delivery fixes (always on)
+Most of the work is WebRTC stability: no more freezes from OME's own send path, loss recovery that works, and auto ABR that settles on the right rendition. All of it was found and measured with the [pre-release real-world test](misc/README.md) in `misc/`. That test plays streams to real Chrome and Firefox through controlled loss, delay, jitter, outages and bottlenecks, and measures frame drops, freezes, delay and memory.
 
-Found and measured with the [pre-release real-world test](misc/README.md) in `misc/`, which plays streams to real Chrome and Firefox through controlled loss, delay, jitter, outages and bottlenecks, and measures frame drops, freezes, delay and memory.
+### Features
+
+* **NVIDIA NVENC / NVDEC:** restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
+* **Scheduled Channel SegmentCache:** for bypass `file://` H.264+AAC MP4 items, indexes samples and can serve HLS/LLHLS while idle without keeping the demux media pump running (near-zero media disk I/O when no WebRTC/OVT viewers are connected). Configure it under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
+* **Opt-in WebRTC features**, set under `<Publishers><WebRTC>`. Each one helps in some conditions and costs something in others, so each is off by default (upstream behaviour). See [WebRTC Streaming](docs/streaming/webrtc-publishing.md#publisher) for when to use them.
+
+  | Setting | What it does | Trade-off |
+  |---|---|---|
+  | `<SendPacing>true</SendPacing>` | Spreads bursts beyond a keyframe (retransmissions after an outage, a backlog after an ingest stall) at 2.5x the media rate, retransmissions first | Behind a 10 Mbps / 100 ms queue: a 1 s outage froze 6.8 s, now 1.0 s. On a path that could take the whole burst, backlogs drain a little slower |
+  | `<VideoShedding>true</VideoShedding>` | A congested session that cannot switch down (a pinned rendition, or auto ABR on its lowest one) stops video until the next keyframe. It sheds only while the link carries less than the stream and the queue grows or packets are lost, and again only on feedback for frames sent after it resumed | A pinned 1080p viewer on a too-narrow link froze 25–28 s, now about 1 s. A longer path (jitter) does not trigger it. Each shed costs up to one GOP: only for short GOPs |
+  | `<PlayoutDelay><Adaptive>true</Adaptive></PlayoutDelay>` | A session that keeps losing packets on a long path raises its own playout delay to the path's base round trip + 80 ms, and lowers it again slowly once the loss stops | 300 ms round trip with 1% loss: about 16 freezes in 30 s, now about 6. Costs that viewer several hundred ms of latency |
+  | `<JitterBufferDelay><Min>80</Min><Max>500</Max></JitterBufferDelay>` | The hold range of `<JitterBuffer>` (default 20 ms minimum, as upstream) | Soak-tested with several heavy renditions at once; a longer minimum adds that delay for every viewer |
+
+* **`?rendition=` signalling query parameter:** start a WebRTC session on a given rendition ([docs](docs/streaming/webrtc-publishing.md#rendition-query-parameter)).
+* **B-frame warning:** a warning is logged once per track when H.264 video for WebRTC has B-frames, which Chrome's software H.264 decoder cannot play (it then shows keyframes only).
+* **Pre-release real-world test** ([misc/README.md](misc/README.md)): a WebRTC smoke test that decodes what Chrome assembles on 6 network profiles; a traffic simulator with churning publishers, lightweight WebRTC and LL-HLS viewers and real desktop browsers; a limits test that takes each impairment up to its limit; and a one-command setup for a Windows desktop as a remote test browser.
+
+### Bug fixes
+
+**WebRTC, always on:**
 
 * **Retransmission (`<Rtx>`):**
   * a late NACK is never answered with the wrong packet (the sent log matched slots, not sequence numbers);
@@ -18,42 +37,28 @@ Found and measured with the [pre-release real-world test](misc/README.md) in `mi
   * packets older than the newest keyframe are not resent once that keyframe has had time to arrive.
 * **ULPFEC (`<Ulpfec>`)** now actually recovers packets: before, browsers recovered none.
   * The parity covers header extensions as RFC 5109 requires, uses each session's own sequence numbers, is RED-wrapped and follows right behind its frame.
-  * It is encoded on a bounded worker, off the send path (no more crash or memory growth under load).
+  * It is encoded on a bounded worker, off the send path. Encoding inline delayed every 4K frame by tens of ms; a thread per frame crashed and ran out of memory under load.
   * Lost parity can be retransmitted.
   * After a slow repair, the sequence numbers Chrome has forgotten as padding are announced again. Without that, a repair on a path with 50 ms or more round trip could freeze the viewer until the next keyframe.
   * Peers that did not negotiate RED still get plain RTP.
 * **Auto ABR** works. Before, it fell to the lowest rendition within seconds on a clean path and stayed there, because FEC packets read as loss in the transport-wide feedback.
-  * Feedback arrival times are parsed correctly.
+  * Feedback arrival times are parsed correctly (receive deltas accumulate).
   * Capacity is measured from packet trains.
   * It settles on the best rendition for the link within seconds, and switches back up after congestion.
   * REMB is ignored while transport-wide feedback flows (Chrome's REMB forced needless down-switches).
   * The frame after a switch keyframe is no longer lost.
 * **Several renditions at once** (a 4K passthrough beside a transcoded ladder) no longer freeze each other. Each session has its own send thread, each rendition packetizes on its own worker, and the UDP send buffer is larger.
-* **`<JitterBuffer>`:**
-  * sends frames in decode order (B-frames were sent ahead of their references);
+* **Pacer (`<JitterBuffer>`):**
+  * sends frames in decode order (B-frames were sent ahead of their references, which showed as smearing on motion);
+  * releases each frame at its decode-time target, capped at its arrival plus the delay, so the source's arrival jitter no longer reaches viewers (send-time p99 125 → 72 ms, 30–55 ms less delay to the screen);
   * holds each frame from its arrival, so catch-up bursts no longer look like freezes;
-  * releases late frames sooner;
   * takes its hold range from `<JitterBufferDelay>`.
-* **H.264 over WebRTC:**
-  * access unit delimiters and timing-only SEI are left out (about 7% fewer packets; captions SEI is kept);
-  * a warning is logged once per track with B-frames, which Chrome's software H.264 decoder cannot play.
-* **`?rendition=` signalling query parameter:** start a session on a given rendition ([docs](docs/streaming/webrtc-publishing.md#rendition-query-parameter)).
+* **H.264:** access unit delimiters and timing-only SEI are left out of the RTP stream (about 7% fewer packets; captions SEI is kept).
+* **RTP header extensions:** framemarking (an expired draft that no browser negotiates) is no longer offered or sent. It went on every video packet, and Chrome logged a warning for each one.
+* **Logs:** the keyframe-send warning (`RtcKfDrain`) fires only when a send actually stalls, at most once per 10 s per session. Before, it fired for every keyframe of every high-resolution viewer.
 
-### Opt-in WebRTC features
+**Elsewhere:**
 
-Each one helps in some conditions and costs something in others, so each is off by default (upstream behaviour). See [WebRTC Streaming](docs/streaming/webrtc-publishing.md#publisher) for when to use them.
-
-| Setting (under `<Publishers><WebRTC>`) | What it does | Trade-off |
-|---|---|---|
-| `<SendPacing>true</SendPacing>` | Spreads bursts beyond a keyframe (retransmissions after an outage, a backlog after an ingest stall) at 2.5x the media rate, retransmissions first | Behind a 10 Mbps / 100 ms queue: a 1 s outage froze 6.8 s, now 1.0 s. On a path that could take the whole burst, backlogs drain a little slower |
-| `<VideoShedding>true</VideoShedding>` | A congested session that cannot switch down stops video until the next keyframe | A pinned 1080p viewer on a too-narrow link froze 25–28 s, now about 1 s. Each shed costs up to one GOP: only for short GOPs |
-| `<PlayoutDelay><Adaptive>true</Adaptive></PlayoutDelay>` | A session that keeps losing packets on a long path raises its own playout delay to the round trip + 80 ms | 300 ms round trip with 1% loss: about 16 freezes in 30 s, now about 6. Costs that viewer several hundred ms of latency |
-| `<JitterBufferDelay><Min>80</Min></JitterBufferDelay>` | A longer minimum hold for `<JitterBuffer>` (default 20 ms, as upstream) | Soak-tested with several heavy renditions at once; adds 60 ms for every viewer |
-
-### Other additions and fixes
-
-* **NVIDIA NVENC / NVDEC:** restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
-* **Scheduled Channel SegmentCache:** for bypass `file://` H.264+AAC MP4 items, indexes samples and can serve HLS/LLHLS while idle without keeping the demux media pump running (near-zero media disk I/O when no WebRTC/OVT viewers are connected). Configure it under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
 * **Scheduled Channel:** the demux burst stops after idle. SegmentCache's idle HLS keeps its media and discontinuity sequence numbers monotonic across items and file wraps.
 * **HLS / LLHLS:**
   * spec-valid `TARGETDURATION` and `BANDWIDTH` for SegmentCache playlists;
