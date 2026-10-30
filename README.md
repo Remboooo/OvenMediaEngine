@@ -27,42 +27,34 @@ Most of the work is WebRTC stability: no more freezes from OME's own send path, 
 
 ### Bug fixes
 
+Compared with upstream OvenMediaEngine.
+
 **WebRTC, always on:**
 
 * **Retransmission (`<Rtx>`):**
   * a late NACK is never answered with the wrong packet (the sent log matched slots, not sequence numbers);
   * a stale cached copy is never served after the history slot was reused;
   * every NACKed packet is resent, not only the first;
-  * retransmissions get fresh transport-wide sequence numbers, as in libwebrtc;
-  * packets older than the newest keyframe are not resent once that keyframe has had time to arrive.
+  * retransmissions get fresh transport-wide sequence numbers, as in libwebrtc.
 * **ULPFEC (`<Ulpfec>`)** now actually recovers packets: before, browsers recovered none.
-  * The parity covers header extensions as RFC 5109 requires, uses each session's own sequence numbers, is RED-wrapped and follows right behind its frame.
-  * It is encoded on a bounded worker, off the send path. Encoding inline delayed every 4K frame by tens of ms; a thread per frame crashed and ran out of memory under load.
-  * Lost parity can be retransmitted.
+  * The parity covers header extensions as RFC 5109 requires and uses each session's own sequence numbers.
+  * It is encoded on a bounded worker, off the send path; encoded inline, it delayed every 4K frame by tens of ms.
   * After a slow repair, the sequence numbers Chrome has forgotten as padding are announced again. Without that, a repair on a path with 50 ms or more round trip could freeze the viewer until the next keyframe.
-  * Peers that did not negotiate RED still get plain RTP.
-* **Auto ABR** works. Before, it fell to the lowest rendition within seconds on a clean path and stayed there, because FEC packets read as loss in the transport-wide feedback.
+* **Auto ABR** works. Before, it fell to the lowest rendition within seconds on a clean path and stayed there, because FEC packets left gaps in the transport-wide sequence numbers that read as loss.
   * Feedback arrival times are parsed correctly (receive deltas accumulate).
   * Capacity is measured from packet trains.
   * It settles on the best rendition for the link within seconds, and switches back up after congestion.
   * REMB is ignored while transport-wide feedback flows (Chrome's REMB forced needless down-switches).
-  * The frame after a switch keyframe is no longer lost.
 * **Several renditions at once** (a 4K passthrough beside a transcoded ladder) no longer freeze each other. Each session has its own send thread, each rendition packetizes on its own worker, and the UDP send buffer is larger.
 * **Pacer (`<JitterBuffer>`):**
-  * sends frames in decode order (B-frames were sent ahead of their references, which showed as smearing on motion);
-  * releases each frame at its decode-time target, capped at its arrival plus the delay, so the source's arrival jitter no longer reaches viewers (send-time p99 125 → 72 ms, 30–55 ms less delay to the screen);
-  * holds each frame from its arrival, so catch-up bursts no longer look like freezes;
-  * takes its hold range from `<JitterBufferDelay>`.
+  * sends frames in decode order (it scheduled on PTS, so B-frames went out ahead of their references, which showed as smearing on motion);
+  * releases each frame at its decode-time target but holds it no longer than its arrival plus the delay, so the source's arrival jitter and catch-up bursts no longer reach viewers as freezes.
 * **H.264:** access unit delimiters and timing-only SEI are left out of the RTP stream (about 7% fewer packets; captions SEI is kept).
 * **RTP header extensions:** framemarking (an expired draft that no browser negotiates) is no longer offered or sent. It went on every video packet, and Chrome logged a warning for each one.
-* **Logs:** the keyframe-send warning (`RtcKfDrain`) fires only when a send actually stalls, at most once per 10 s per session. Before, it fired for every keyframe of every high-resolution viewer.
 
 **Elsewhere:**
 
-* **Scheduled Channel:** the demux burst stops after idle. SegmentCache's idle HLS keeps its media and discontinuity sequence numbers monotonic across items and file wraps.
-* **HLS / LLHLS:**
-  * spec-valid `TARGETDURATION` and `BANDWIDTH` for SegmentCache playlists;
-  * LLHLS sessions sharing a keep-alive connection no longer leak.
+* **LLHLS:** sessions sharing a keep-alive connection (e.g. an nginx upstream pool) no longer leak.
 * **Monitoring:** session counters no longer drift when a stream is deleted while viewers are connected.
 
 Everything else follows upstream OvenMediaEngine.
