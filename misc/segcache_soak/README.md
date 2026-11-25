@@ -73,6 +73,18 @@ Pieces:
 
 WebRTC tester: `../oven_rtc_tester/` (`OvenRtcTester` binary).
 
+## Known harness limits
+
+The ffmpeg clients fail on both builds in ways that are the client's, not OME's; compare against a baseline run
+of the previous binary rather than reading failures as absolute:
+
+- `soak.py` LLHLS watch: after a loop wrap the fMP4 timestamps step back by the clip length. `ffmpeg -re`
+  re-offsets audio but stops advancing video, so a 60 s watch of a 60 s clip stalls at media 60.0 s. hls.js
+  plays the same wraps (`run_wrap_soak.sh`).
+- `stress.py` churn: short-lived ffmpeg HLS / LLHLS clients report `skipping N segments ahead`, 404s for
+  segments that left the window, `exit=234` and stalls. About a third of HLS / LLHLS churn clients on either
+  build; WebRTC churn clients, cold starts and the idle I/O / CPU checks are the ones to hold to zero failures.
+
 ## Live instance (optional)
 
 ```bash

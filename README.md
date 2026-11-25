@@ -10,7 +10,7 @@ Most of the work is WebRTC stability: no more freezes from OME's own send path, 
 
 ### Features
 
-* **NVIDIA NVENC / NVDEC:** restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path).
+* **NVIDIA NVENC / NVDEC:** restores hardware H.264/H.265 encode and decode on OME 0.21.0 and later (upstream removed this path). Enable it with `<HardwareAcceleration>true</HardwareAcceleration>` in `<OutputProfiles>`; the newer `<HWAccels>` options are still forced to software, as upstream, and only log a warning.
 * **Scheduled Channel SegmentCache:** for bypass `file://` H.264+AAC MP4 items, indexes samples and can serve HLS/LLHLS while idle without keeping the demux media pump running (near-zero media disk I/O when no WebRTC/OVT viewers are connected). Configure it under `Providers/Schedule/SegmentCache` in Server.xml; see [Scheduled Channel](docs/live-source/scheduled-channel.md#segment-cache).
 * **Opt-in WebRTC features**, set under `<Publishers><WebRTC>`. Each one helps in some conditions and costs something in others, so each is off by default (upstream behaviour). See [WebRTC Streaming](docs/streaming/webrtc-publishing.md#publisher) for when to use them.
 
@@ -54,7 +54,6 @@ Compared with upstream OvenMediaEngine.
 
 **Elsewhere:**
 
-* **LLHLS:** sessions sharing a keep-alive connection (e.g. an nginx upstream pool) no longer leak.
 * **Monitoring:** session counters no longer drift when a stream is deleted while viewers are connected.
 
 Everything else follows upstream OvenMediaEngine.

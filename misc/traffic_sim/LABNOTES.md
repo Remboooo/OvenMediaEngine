@@ -634,3 +634,20 @@ Smoke ×5 vs capped ×5 (`cmp_early_r*`, `cmp_capped_r*`; capped r5 rerun in the
   ~272 min each, same exclusions): freezes 67.4 vs 64.9/h (p=0.88), frozen 35.9 vs 29.4 s/h (p=0.49),
   >= 0.9 s 8.4 vs 4.4/h (p=0.044, rebased better), switches 131 vs 139/h (p=0.24), join same; e2e p50 +3 ms
   median on rebased (p=0.015). Verdict: rebased at least as good; a few ms of e2e accepted.
+- Rebase check of the scheduled-channel / SegmentCache patches (misc/segcache_soak on the dogfood OME, same
+  harness and media for both builds). Two of the four patches changed in the rebase: the SegmentCache commit
+  (an enum entry beside upstream's new RECOVERY result; the LLHLS session-key recovery dropped, because upstream
+  #2377 removed that field and keys sessions by path), and the idle demux fix (context only). The fork's LLHLS
+  keep-alive leak fix was dropped too: #2377 covers it. Unit tests pass (scheduled 31, LLHLS 36, HLS 19, modules
+  665 + 2 placeholders).
+  Found: after the channel had been idle a minute, a WebRTC viewer got its first frame after 61 s (fork 0.3 s).
+  Upstream's stall recovery (#2416) restarts the pacing clock at the first packet; the fork's resume-from-idle
+  anchors the track offsets to that clock's elapsed time, so the offsets pointed one idle period ahead of a
+  clock at zero. Fixed (`fix(scheduled): resume the pump at once after SegmentCache idle`): the anchor is reset
+  where the clock restarts. After the fix: first frame 0.29 s; soak.py WebRTC 3577 / 3584 frames.
+  stress.py, 600 s, 172 clients, fixed rebased vs fork: WebRTC 0/54 vs 0/49 failed, HLS 19/61 vs 22/59, LLHLS
+  18/50 vs 21/57; idle disk reads 0 B, CPU 4.4% on both; cold starts pass on both. The HLS / LLHLS failures are
+  the harness's ffmpeg client on both builds (see segcache_soak/README.md). The hls.js wrap soak passes.
+- NVENC / NVDEC: only the deprecated `<HardwareAcceleration>true</HardwareAcceleration>` enables them, in the
+  fork and the rebase alike; `<HWAccels><Encoder|Decoder><Enable>` is forced off with a warning (upstream's
+  deprecation). The traffic_sim config keeps the deprecated option for that reason.
