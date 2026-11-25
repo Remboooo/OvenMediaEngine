@@ -1133,11 +1133,14 @@ namespace pvd
 
 			int64_t dts_us = Rescale(dts, 1000000 * track->GetTimeBase().GetNum(), track->GetTimeBase().GetDen());
 
-			// Pacing restarts at the first packet, so opening the file after a recovery does not count as lag
+			// Pacing restarts at the first packet, so opening the file after a recovery does not count as lag.
+			// The clock now starts at zero, so the anchor that kept a resumed pump (after SegmentCache idle)
+			// in step with the old clock goes too: left in place, the pump waited out the whole idle time.
 			if (_global_track_offset_us_map.empty())
 			{
 				_realtime_clock = ov::StopWatch();
 				_realtime_clock.Start();
+				_pacing_anchor_elapsed_us = 0;
 			}
 
 			if (_global_track_offset_us_map.find(track_id) == _global_track_offset_us_map.end())
