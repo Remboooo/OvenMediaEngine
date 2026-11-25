@@ -82,6 +82,10 @@ protected:
 		ASSERT_TRUE(session->_rtp_rtcp->AddRtpSender(kVideoPayloadType, kVideoSsrc, 90000, "test"));
 		session->_rtp_rtcp->RegisterNextNode(wire);
 		ASSERT_TRUE(session->_rtp_rtcp->Start());
+
+		// Retransmissions go out on the session's send thread; this test drains its queue itself
+		session->SetState(pub::Session::SessionState::Started);
+		session->_send_running = true;
 	}
 
 	void LogSentVideoPacket(uint16_t sequence_number)
@@ -110,6 +114,8 @@ protected:
 			nack->AddLostId(id);
 		}
 		session->ProcessNACK(nack);
+		// What the send thread does when woken
+		session->SendQueuedRtx();
 	}
 
 	uint16_t NextRtxSequenceNumber() const

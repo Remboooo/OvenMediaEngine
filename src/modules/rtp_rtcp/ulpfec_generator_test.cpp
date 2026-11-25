@@ -369,10 +369,8 @@ TEST(UlpfecGenerator, FecPacketsTravelWithTheFrameTheyProtect)
 		EXPECT_FALSE(packet->Marker());
 		EXPECT_NE(packet->Extension(RTP_HEADER_EXTENSION_TRANSPORT_CC_ID), nullptr) << "a session stamps the transport-wide sequence number here";
 
-		const uint8_t *frame_marking = packet->Extension(RTP_HEADER_EXTENSION_FRAMEMARKING_ID);
-		ASSERT_NE(frame_marking, nullptr);
-		const size_t element_header_size = (packet->GetExtensionType() == RtpHeaderExtension::HeaderType::ONE_BYTE_HEADER) ? 1 : 2;
-		EXPECT_EQ(frame_marking[element_header_size], 0) << "an FEC packet marks no frame boundary";
+		// Framemarking is not sent: no browser negotiates it
+		EXPECT_EQ(packet->Extension(RTP_HEADER_EXTENSION_FRAMEMARKING_ID), nullptr);
 	}
 }
 

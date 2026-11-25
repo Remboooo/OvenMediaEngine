@@ -35,19 +35,21 @@ namespace
 	constexpr uint8_t kUlpfecPt = 122;
 	constexpr uint32_t kTrackId = 7;
 
-	std::vector<std::shared_ptr<RedRtpPacket>> MakeFrame(uint16_t first_seq, size_t count, size_t payload_len = 1000)
+	std::vector<UlpfecEncodeWorker::MediaPacket> MakeFrame(uint16_t first_seq, size_t count, size_t payload_len = 1000)
 	{
-		std::vector<std::shared_ptr<RedRtpPacket>> media;
+		std::vector<UlpfecEncodeWorker::MediaPacket> media;
 		std::vector<uint8_t> payload(payload_len, 0xAB);
 		for (size_t i = 0; i < count; i++)
 		{
-			RtpPacket rtp;
-			rtp.SetPayloadType(kMediaPt);
-			rtp.SetSequenceNumber(static_cast<uint16_t>(first_seq + i));
-			rtp.SetTimestamp(1000);
-			rtp.SetMarker(i + 1 == count);
-			rtp.SetPayload(payload.data(), payload.size());
-			media.push_back(std::make_shared<RedRtpPacket>(kRedPt, rtp));
+			auto rtp = std::make_shared<RtpPacket>();
+			rtp->SetPayloadType(kMediaPt);
+			rtp->SetSequenceNumber(static_cast<uint16_t>(first_seq + i));
+			rtp->SetTimestamp(1000);
+			rtp->SetMarker(i + 1 == count);
+			rtp->SetFirstPacketOfFrame(i == 0);
+			rtp->SetLastPacketOfFrame(i + 1 == count);
+			rtp->SetPayload(payload.data(), payload.size());
+			media.push_back({rtp, static_cast<uint16_t>(first_seq + i)});
 		}
 		return media;
 	}
@@ -92,7 +94,7 @@ TEST(UlpfecEncodeWorker, ResultsInSubmitOrder)
 	UlpfecEncodeWorker worker("test-fec");
 	for (uint32_t ts = 1; ts <= 5; ts++)
 	{
-		worker.Submit(ts, kTrackId, MakeFrame(static_cast<uint16_t>(ts * 100), 14));
+		worker.Submit(ts, ts * 10ULL, MakeFrame(static_cast<uint16_t>(ts * 100), 14));
 	}
 
 	auto results = DrainAll(worker, 5);
@@ -101,8 +103,7 @@ TEST(UlpfecEncodeWorker, ResultsInSubmitOrder)
 	for (size_t i = 0; i < results.size(); i++)
 	{
 		EXPECT_EQ(results[i].timestamp, i + 1);
-		EXPECT_EQ(results[i].track_id, kTrackId);
-		// 14 media packets / 7 per FEC packet -> 2 parity packets.
+		EXPECT_EQ(results[i].ntp_timestamp, (i + 1) * 10ULL);
 		EXPECT_TRUE(results[i].generator->IsAvailableFecPackets());
 	}
 }
@@ -113,7 +114,7 @@ TEST(UlpfecEncodeWorker, ReadyQueueIsBoundedWhenNotDrained)
 	constexpr size_t kFrames = 50;
 	for (uint32_t ts = 1; ts <= kFrames; ts++)
 	{
-		worker.Submit(ts, kTrackId, MakeFrame(static_cast<uint16_t>(ts * 100), 7, 100));
+		worker.Submit(ts, ts * 10ULL, MakeFrame(static_cast<uint16_t>(ts * 100), 7, 100));
 	}
 
 	// Let the worker go idle without anyone draining.
@@ -140,7 +141,7 @@ TEST(UlpfecEncodeWorker, DestroyWithPendingJobs)
 	auto worker = std::make_unique<UlpfecEncodeWorker>("test-fec");
 	for (uint32_t ts = 1; ts <= 20; ts++)
 	{
-		worker->Submit(ts, kTrackId, MakeFrame(static_cast<uint16_t>(ts * 300), 240));
+		worker->Submit(ts, ts * 10ULL, MakeFrame(static_cast<uint16_t>(ts * 300), 240));
 	}
 	worker.reset();	 // must join promptly, not hang or crash
 	SUCCEED();

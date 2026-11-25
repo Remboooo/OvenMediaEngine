@@ -1650,11 +1650,10 @@ void RtcSession::ReannounceFecPadding(const std::shared_ptr<RtcStream> &stream, 
 		}
 
 		auto rtx_packet = stream->GetRtxRtpPacket(sent_log->_track_id, sent_log->_payload_type, sent_log->_origin_sequence_number);
-		if (rtx_packet != nullptr)
+		if (rtx_packet == nullptr)
 		{
-			auto copy_rtx_packet = std::make_shared<RtxRtpPacket>(*rtx_packet);
-			copy_rtx_packet->SetSequenceNumber(_rtx_sequence_number++);
-			copy_rtx_packet->SetOriginalSequenceNumber(sent_log->_sequence_number);
+			continue;
+		}
 
 		for (int copy = 0; copy < kCopies; copy++)
 		{

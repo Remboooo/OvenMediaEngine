@@ -369,8 +369,6 @@ namespace mon
 				}
 
 				{
-					std::lock_guard<std::mutex> lock(_session_guard);
-
 					// The input stream is deleted before its output streams, whose publishers keep reporting
 					// sessions until then. Releasing the output streams here makes those reports count nothing,
 					// and subtracts their sessions from the input stream too, so only its own are left below.
@@ -394,7 +392,6 @@ namespace mon
 
 				{
 					// Usually already released with its input stream
-					std::lock_guard<std::mutex> lock(_session_guard);
 					ReleaseSessions(output_stream_metric);
 				}
 
@@ -531,7 +528,6 @@ namespace mon
 			return;
 		}
 
-		std::lock_guard<std::mutex> lock(_session_guard);
 		if (stream_metric->AreSessionsReleased() || IsInputStreamDeleted(app_metric, stream_metric))
 		{
 			// The stream was deleted, and its sessions were subtracted with it
@@ -571,7 +567,6 @@ namespace mon
 			return;
 		}
 
-		std::lock_guard<std::mutex> lock(_session_guard);
 		if (stream_metric->AreSessionsReleased() || IsInputStreamDeleted(app_metric, stream_metric))
 		{
 			// The stream was deleted, and its sessions were subtracted with it
@@ -611,7 +606,6 @@ namespace mon
 			return;
 		}
 
-		std::lock_guard<std::mutex> lock(_session_guard);
 		if (stream_metric->AreSessionsReleased() || IsInputStreamDeleted(app_metric, stream_metric))
 		{
 			// The stream was deleted, and its sessions were subtracted with it

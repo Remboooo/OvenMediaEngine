@@ -309,9 +309,7 @@ void RtpPacketizer::EmitReadyFec()
 			continue;
 		}
 
-		// FEC packets go with their frame (track, timestamps, the extensions a session stamps) but mark no frame boundary
-		_framemarking_extension->Reset();
-
+		// FEC packets go with their frame: track, timestamps and the extensions a session stamps
 		auto fec_header = AllocatePacket();
 		fec_header->SetTimestamp(result.timestamp);
 		fec_header->SetNTPTimestamp(result.ntp_timestamp);
