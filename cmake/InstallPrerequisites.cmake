@@ -743,7 +743,9 @@ if(ENABLE_X264)
 endif()
 
 if(ENABLE_NVIDIA)
-    list(APPEND _targets ffnvcodec)
+    # FFmpeg's configure needs the headers (--enable-ffnvcodec), so they go in before it
+    list(FIND _targets ffmpeg _ffmpeg_index)
+    list(INSERT _targets ${_ffmpeg_index} ffnvcodec)
 endif()
 
 # Override with single target if requested
