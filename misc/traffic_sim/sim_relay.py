@@ -44,7 +44,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'webrtc_impair'))
-from impair_relay import Shaper, big_rcvbuf, parse_range  # noqa: E402
+from impair_relay import NamedDraws, Shaper, big_rcvbuf, draws_for, parse_range  # noqa: E402
 
 FLOW_IDLE_S = 60  # close an ICE flow's upstream socket after this long without packets
 
@@ -57,6 +57,13 @@ FLOW_IDLE_S = 60  # close an ICE flow's upstream socket after this long without 
 # and seq holds its FMT/count field (205/1 NACK, 205/15 transport-cc, 206/1 PLI, 206/4 FIR, 206/15 REMB).
 TRACE_FIELDS = 't,dir,fate,due_ms,kind,size,ssrc,pt,seq,ts,marker'
 STUN_DUMP = os.environ.get('SIM_RELAY_STUN_DUMP')  # also append each traced STUN message, in hex, to this file
+
+
+def packet_stream(data):
+    """The packet stream NamedDraws numbers a packet in: RTP by payload type (media, RTX and RED/FEC each count
+    their own packets, so a build that retransmits more does not shift the media packets' fates), else its kind."""
+    kind, h = classify(data)
+    return f'rtp{h[1]}' if kind == 'rtp' else kind
 
 
 def classify(data):
@@ -97,8 +104,11 @@ class Classes:
 
 
 class Tag:
-    def __init__(self, cid, cls):
+    def __init__(self, cid, cls, seed=0):
         self.id, self.cls = cid, cls
+        # Per direction, shared by the client's flows and connections: its k-th packet of each packet stream gets
+        # the same fate in every run of the seed (NamedDraws), whatever the other clients do
+        self.draws = {d: NamedDraws(f'{seed}:{cid}:{d}') for d in ('u', 'd')}
         self.blackholed = False
         self.trace = None  # open file while traced
         self.hold_until = {'d': 0.0, 'u': 0.0}  # loop time until which UDP is queued
@@ -115,10 +125,11 @@ class TcpShaper:
         self.link_free_at = 0.0
 
     def due(self, cfg, size, now):
+        draw = draws_for(self.rng, 'tcp')
         delay = cfg.get('delay_ms', 0) / 1000
         if cfg.get('jitter_ms'):
-            delay = max(0.0, delay + self.rng.gauss(0, cfg['jitter_ms'] / 1000))
-        if self.rng.random() < cfg.get('loss', 0.0):
+            delay = max(0.0, delay + draw.gauss('jitter', cfg['jitter_ms'] / 1000))
+        if draw.random('loss') < cfg.get('loss', 0.0):
             delay += 0.2
         every = cfg.get('stall_every_s', 0)
         if every:
@@ -154,7 +165,7 @@ class Relay:
     def tag(self, cid, cls):
         t = self.tags.get(cid)
         if t is None:
-            t = self.tags[cid] = Tag(cid, cls)
+            t = self.tags[cid] = Tag(cid, cls, self.args.seed)
         t.cls = cls
         return t
 
@@ -242,7 +253,7 @@ class Relay:
             return
         cfg = self.classes.get(tag.cls, 'down' if direction == 'd' else 'up')
         now = self.loop.time()
-        delays = shaper.plan(cfg, len(data), now)
+        delays = shaper.plan(cfg, len(data), now, packet_stream(data))
         held = tag.hold_until[direction] - now
         if held > 0 and delays:
             # Everything queued behind the stall leaves when it ends, in arrival order
@@ -295,8 +306,8 @@ class Relay:
         now = self.loop.time()
         done = asyncio.Event()  # OME closed its side: tear everything down
         await asyncio.gather(
-            self.tcp_pipe(reader, up_writer, tag, 'up', TcpShaper(self.rng, now), done, toward_ome=True),
-            self.tcp_pipe(up_reader, writer, tag, 'down', TcpShaper(self.rng, now), done, toward_ome=False),
+            self.tcp_pipe(reader, up_writer, tag, 'up', TcpShaper(tag.draws['u'], now), done, toward_ome=True),
+            self.tcp_pipe(up_reader, writer, tag, 'down', TcpShaper(tag.draws['d'], now), done, toward_ome=False),
         )
         stats['tcp_open'] -= 1
 
@@ -370,14 +381,14 @@ class Relay:
     async def run(self):
         a = self.args
         loop = self.loop = asyncio.get_running_loop()
-        default = Tag('?', a.default_class)
+        default = Tag('?', a.default_class, a.seed)
 
         def sig_handler(r, w):
             tag, self.pending_sig = self.pending_sig or default, None
             return self.tcp_accept(r, w, a.sig, tag)
 
         def ingest_handler(r, w):
-            tag, self.pending_ingest = self.pending_ingest or Tag('?', 'uplink_clean'), None
+            tag, self.pending_ingest = self.pending_ingest or Tag('?', 'uplink_clean', self.args.seed), None
             return self.tcp_accept(r, w, a.ingest_target, tag)
 
         async def listen(handler, host, port):
@@ -400,7 +411,7 @@ class Relay:
             port = a.http_base + len(self.http_ports)
             # limits.py addresses its HTTP client as "lim_http" (hold); other classes' connections are anonymous
             await listen(
-                lambda r, w, c=cls: self.tcp_accept(r, w, a.sig, self.tag('lim_http', c) if c == 'lim' else Tag(None, c)),
+                lambda r, w, c=cls: self.tcp_accept(r, w, a.sig, self.tag('lim_http', c) if c == 'lim' else Tag(None, c, a.seed)),
                 '127.0.0.1', port)
             self.http_ports[cls] = port
         _, ice_ports = parse_range(f'x:{a.ice}')
@@ -421,9 +432,9 @@ class Relay:
 
 
 class Flow:
-    def __init__(self, tag, now, rng):
+    def __init__(self, tag, now):
         self.tag, self.last_seen = tag, now
-        self.up, self.down = Shaper(rng, now), Shaper(rng, now)
+        self.up, self.down = Shaper(tag.draws['u'], now), Shaper(tag.draws['d'], now)
         self.transport = None
 
 
@@ -442,8 +453,8 @@ class IceListen(asyncio.DatagramProtocol):
         flow = r.flows.get(key)
         now = r.loop.time()
         if flow is None:
-            tag = r.current_ice or Tag('?', r.args.default_class)
-            flow = r.flows[key] = Flow(tag, now, r.rng)
+            tag = r.current_ice or Tag('?', r.args.default_class, r.args.seed)
+            flow = r.flows[key] = Flow(tag, now)
             tag.stats['udp_flows'] += 1
             r.loop.create_task(self.open(flow, addr, data))
             return

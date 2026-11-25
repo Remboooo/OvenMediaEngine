@@ -101,12 +101,80 @@ def now_s():
 
 
 # ===================================================================== plumbing
+class Plan:
+    """Every random decision of a run's schedule, by name, in a JSON file.
+
+    Decisions are keyed by actor and field ("pub:p2:3" -> {"uplink": ..., "live_s": ...}, "desk:deskA-chrome:5",
+    "viewer:17"), not drawn from one stream in call order: actors draw when wall-clock timing lets them, so a
+    shared stream would hand two runs of a seed different schedules, and any change to the code that draws would
+    reshuffle everything after it. With --plan a run replays the file. A decision the file lacks (a desktop that
+    cycled through more sessions, a field new to the code) is generated from (seed, actor, field) alone and
+    written back, so A/B runs of one plan see the same value. Every run writes the plan it used to <out>/plan.json."""
+
+    def __init__(self, path, seed, out_path):
+        self.path, self.out_path = (Path(path).resolve() if path else None), out_path  # OME runs in conf/
+        self.data = {'seed': seed, 'decisions': {}}
+        if self.path and self.path.exists():
+            self.data = json.loads(self.path.read_text())
+        self.seed = self.data['seed']
+        self.replayed = self.added = 0
+
+    def actor(self, *key):
+        return Draws(self, ':'.join(str(k) for k in key))
+
+    def get(self, actor, field, gen):
+        fields = self.data['decisions'].setdefault(actor, {})
+        if field in fields:
+            self.replayed += 1
+            return fields[field]
+        value = fields[field] = gen(random.Random(f'{self.seed}:{actor}:{field}'))
+        self.added += 1
+        return value
+
+    def save(self):
+        text = json.dumps(self.data, indent=1, sort_keys=True)
+        for p in {self.out_path, self.path} - {None}:
+            tmp = p.with_name(p.name + '.tmp')
+            tmp.write_text(text)
+            tmp.replace(p)
+
+
+class Draws:
+    """One actor's named decisions (Plan). Values are stored as drawn, so items must be JSON values."""
+
+    def __init__(self, plan, actor):
+        self.plan, self.actor = plan, actor
+
+    def uniform(self, field, a, b):
+        return self.plan.get(self.actor, field, lambda r: r.uniform(a, b))
+
+    def random(self, field):
+        return self.plan.get(self.actor, field, lambda r: r.random())
+
+    def expovariate(self, field, lambd):
+        return self.plan.get(self.actor, field, lambda r: r.expovariate(lambd))
+
+    def choice(self, field, items, weights=None):
+        return self.plan.get(self.actor, field, lambda r: r.choices(items, weights)[0])
+
+    def pick(self, field, items, weights):
+        """A weighted pick from items that depend on the moment (e.g. the streams live now): the plan holds the
+        uniform draw, not the item."""
+        u = self.random(field) * sum(weights)
+        for item, w in zip(items, weights):
+            u -= w
+            if u < 0:
+                return item
+        return items[-1]
+
+
 class Run:
     def __init__(self, args):
         self.args = args
-        self.rng = random.Random(args.seed)
-        self.t0 = now_s()
         self.out = Path(args.out or ROOT / 'logs' / time.strftime('sim_%Y%m%d_%H%M%S')).resolve()  # OME runs in conf/
+        self.plan = Plan(args.plan, args.seed, self.out / 'plan.json')
+        self.t0 = now_s()
+        self.arrival_n = 0
         (self.out / 'clients').mkdir(parents=True, exist_ok=True)
         self.events = open(self.out / 'events.jsonl', 'w', buffering=1)
         self.samples = open(self.out / 'samples.jsonl', 'w', buffering=1)
@@ -124,7 +192,6 @@ class Run:
         self.viewers = {}                   # viewer id -> Viewer (alive)
         self.vanished = []                  # (t, app, stream, vid) WebRTC viewers whose network vanished
         self.recent_exits = []              # (t, app, stream) WebRTC viewers that left politely or were killed
-        self.vid = 0
         self.qoe = collections.defaultdict(lambda: collections.Counter())
         self.lingering_ingest = {}
         self.generations = collections.Counter()
@@ -248,20 +315,23 @@ class Publisher:
         self.stop_style = None
 
     async def life(self):
-        run, rng, s = self.run, self.run.rng, self.slot
-        await asyncio.sleep(rng.uniform(0, 20))  # stagger first starts
+        run, s = self.run, self.slot
+        await asyncio.sleep(run.plan.actor('pub', run.phase, s['id']).uniform('stagger_s', 0, 20))  # stagger first starts
+        cycle = 0
         while not run.stop.is_set() and not run.quiet.is_set():
-            await self.go_live(rng.choices(UPLINK_CLASSES, UPLINK_WEIGHTS)[0])
-            live_for = rng.uniform(run.args.live_min_s, run.args.live_max_s)
+            d = self.draws = run.plan.actor('pub', run.phase, s['id'], cycle)
+            cycle += 1
+            await self.go_live(d.choice('uplink', UPLINK_CLASSES, UPLINK_WEIGHTS))
+            live_for = d.uniform('live_s', run.args.live_min_s, run.args.live_max_s)
             await wait_any(run, live_for, self.proc)
             if self.proc.returncode is not None and not run.quiet.is_set():
                 await self.died()
             else:
-                style = 'neat' if run.quiet.is_set() else rng.choices(['neat', 'kill', 'uplink_dead'], run.args.stop_weights)[0]
+                style = 'neat' if run.quiet.is_set() else d.choice('stop', ['neat', 'kill', 'uplink_dead'], run.args.stop_weights)
                 await self.go_offline(style)
             if run.quiet.is_set():
                 break
-            await wait_any(run, rng.uniform(run.args.off_min_s, run.args.off_max_s))
+            await wait_any(run, d.uniform('off_s', run.args.off_min_s, run.args.off_max_s))
 
     async def go_live(self, uplink):
         run, s = self.run, self.slot
@@ -272,7 +342,7 @@ class Publisher:
         # keyframe (up to a GOP: 8 s on s720), and its muxer holds the audio back until video comes,
         # so nothing reaches OME and a PacketSilenceTimeoutMs reaps it. A live encoder has no such gap.
         # Rounded down to the ms: a hair before a keyframe still starts on it.
-        offset = math.floor(run.rng.choice([k for k in keyframes(s['src']) if k <= s['src_span_s']]) * 1000) / 1000
+        offset = math.floor(self.draws.choice('offset_s', [k for k in keyframes(s['src']) if k <= s['src_span_s']]) * 1000) / 1000
         listed = await app_streams(s['app'])
         self.prev_listed = listed is not None and s['stream'] in listed
         async with run.connect_lock:
@@ -303,7 +373,7 @@ class Publisher:
             # learns from the silence. Restore the path after the limit so a stream
             # OME never noticed doesn't block this slot for the rest of the run.
             await run.relay_cmd(cmd='blackhole', id=self.tag)
-            await asyncio.sleep(run.rng.uniform(2, 8))
+            await asyncio.sleep(self.draws.uniform('uplink_dead_s', 2, 8))
             run.signal(self.proc, signal.SIGKILL)
             await run.reap(self.proc)
             # Judged in check_streams when the limit passes (the slot may publish again before then).
@@ -361,27 +431,27 @@ async def wait_any(run, seconds, proc=None):
 
 # ===================================================================== viewers
 class Viewer:
-    def __init__(self, run):
-        run.vid += 1
-        rng = run.rng
+    def __init__(self, run, draws, vid):
+        """draws: this viewer's decisions in the plan (Plan.actor); vid: its id, also its relay tag"""
+        self.draws = d = draws
         self.run = run
-        self.id = f'v{run.vid}'
-        self.slot = rng.choices(SLOTS, SLOT_WEIGHTS)[0]
-        self.proto = rng.choices(['webrtc', 'llhls'], [7, 3])[0]
+        self.id = vid
+        self.slot = SLOTS[[x['id'] for x in SLOTS].index(d.choice('slot', [x['id'] for x in SLOTS], SLOT_WEIGHTS))]
+        self.proto = d.choice('proto', ['webrtc', 'llhls'], [7, 3])
         if self.proto == 'webrtc':
-            self.rendition = rng.choices(self.slot['renditions'], self.slot['r_weights'])[0]
+            self.rendition = d.choice('rendition', self.slot['renditions'], self.slot['r_weights'])
         else:
-            self.rendition = rng.choice(self.slot['hls'])
-        self.cls = rng.choices(VIEWER_CLASSES, VIEWER_CLASS_WEIGHTS)[0]
-        kind = rng.choices(['zapper', 'medium', 'long'], [6, 3, 1])[0]
+            self.rendition = d.choice('rendition', self.slot['hls'])
+        self.cls = d.choice('cls', VIEWER_CLASSES, VIEWER_CLASS_WEIGHTS)
+        kind = d.choice('kind', ['zapper', 'medium', 'long'], [6, 3, 1])
         self.kind = kind
-        self.life = {'zapper': rng.uniform(5, 30), 'medium': rng.uniform(60, 300), 'long': rng.uniform(600, 1800)}[kind]
+        self.life = d.uniform('life_s', *{'zapper': (5, 30), 'medium': (60, 300), 'long': (600, 1800)}[kind])
         exits = ['polite', 'kill', 'vanish'] if self.proto == 'webrtc' else ['polite', 'kill']
-        self.exit = rng.choices(exits, [5, 3, 2][:len(exits)])[0]
+        self.exit = d.choice('exit', exits, [5, 3, 2][:len(exits)])
         self.outage = None
-        if self.proto == 'webrtc' and self.cls in ('wifi', 'mobile_4g', 'terrible') and rng.random() < 0.3:
-            self.outage = (rng.uniform(0.2, 0.8) * self.life, rng.uniform(2, 8))
-        self.patience = rng.choice([1, 3, 1000])  # attempts before giving up on an offline stream
+        if self.proto == 'webrtc' and self.cls in ('wifi', 'mobile_4g', 'terrible') and d.random('outage') < 0.3:
+            self.outage = (d.uniform('outage_at', 0.2, 0.8) * self.life, d.uniform('outage_s', 2, 8))
+        self.patience = d.choice('patience', [1, 3, 1000])  # attempts before giving up on an offline stream
         self.proc = None
         self.attempt = 0
         self.connected_once = False
@@ -409,7 +479,7 @@ class Viewer:
                     run.qoe[self.cls]['gave_up'] += 1
                     run.event('viewer_gave_up', id=self.id, attempts=self.attempt)
                     return
-                await wait_any(run, run.rng.uniform(2, 5))
+                await wait_any(run, self.draws.uniform(f'retry{self.attempt}_s', 2, 5))
         finally:
             run.viewers.pop(self.id, None)
             run.qoe[self.cls]['viewers'] += 1
@@ -498,7 +568,7 @@ class Viewer:
             await run.relay_cmd(cmd='blackhole', id=tag)
             run.vanished.append((now_s(), s['app'], s['stream'], tag))
             # The user stares at the frozen picture for a while, then closes the tab.
-            await asyncio.sleep(run.rng.uniform(2, 20))
+            await asyncio.sleep(self.draws.uniform(f'vanish{self.attempt}_s', 2, 20))
             run.signal(p, signal.SIGKILL)
 
     async def llhls_attempt(self, end):
@@ -541,7 +611,8 @@ class DesktopViewer:
     def __init__(self, run, name, endpoint):
         self.run, self.name, self.endpoint = run, name, endpoint
         self.env = dict(os.environ, **({'OME_SOAK_BIDI': endpoint} if endpoint.startswith('ws') else {'OME_SOAK_CDP': endpoint}))
-        self.n = 0
+        # Session numbers: 1.. in the warm-up phase, 101.. in the next, so ids (directories, relay tags) stay unique
+        self.n = 100 * (run.phase - 1)
         self.fast_failures = 0
 
     async def life(self):
@@ -552,18 +623,23 @@ class DesktopViewer:
             if not live:
                 await wait_any(run, 2)
                 continue
-            rec = await self.session(run.rng.choices(live, [SLOT_WEIGHTS[SLOTS.index(s)] for s in live])[0])
+            # Session n of this desktop: the same network class, rendition and life in every run of the plan
+            d = run.plan.actor('desk', run.phase, self.name, self.n + 1)
+            rec = await self.session(d.pick('slot_u', live, [SLOT_WEIGHTS[SLOTS.index(s)] for s in live]), d)
             # Firefox allows one remote session at a time and frees it a moment after the last one ended
             failed_fast = any(e[1] == 'oracle_exit' for e in rec['events']) and rec['secs'] < 10
-            self.fast_failures = self.fast_failures + 1 if failed_fast else 0
+            # Decoding but not painting: the browser's compositor is wedged (seen in Firefox for an hour, every
+            # stream), not the server, which is still delivering frames
+            not_painting = rec.get('decoded', 0) > 60 and rec.get('presented', 0) < 5
+            self.fast_failures = self.fast_failures + 1 if failed_fast or not_painting else 0
             if self.fast_failures >= 3:
-                # The browser is stuck (e.g. a killed client left Firefox's one remote session taken):
-                # the desktop's control service (Setup-RemoteViewer.ps1) restarts the test browser
+                # The browser is stuck (e.g. a killed client left Firefox's one remote session taken, or it
+                # stopped painting): the desktop's control service (Setup-RemoteViewer.ps1) restarts the test browser
                 self.fast_failures = 0
                 res = await asyncio.to_thread(self.restart_browser)
                 run.event('desktop_restart', browser=self.name, result=res)
                 print(f"[{run.t():8.1f}] desktop {self.name}: browser stuck, restart: {res}", flush=True)
-            await wait_any(run, 15 if failed_fast else run.rng.uniform(2, 10))
+            await wait_any(run, 15 if failed_fast else d.uniform('next_s', 2, 10))
 
     def restart_browser(self):
         u = urllib.parse.urlsplit(self.endpoint)
@@ -575,20 +651,20 @@ class DesktopViewer:
         except Exception as e:
             return f'failed: {e}'
 
-    async def session(self, slot):
-        run, rng = self.run, self.run.rng
+    async def session(self, slot, dr):
+        run = self.run
         self.n += 1
-        v = Viewer(run)  # its draws: network class, outage; overridden below where a desktop differs
+        # The viewer's own draws give the network class; the rest is overridden below where a desktop differs
+        v = Viewer(run, run.plan.actor('desk', run.phase, self.name, self.n, 'viewer'), f'{self.name}_{self.n}')
         v.slot = slot
-        v.id = f'{self.name}_{self.n}'
         v.proto = 'webrtc'
-        v.rendition = rng.choices(v.slot['renditions'], v.slot['r_weights'])[0]
-        v.kind = rng.choices(['zapper', 'medium', 'long'], [2, 6, 2])[0]
-        v.life = {'zapper': rng.uniform(15, 40), 'medium': rng.uniform(60, 240), 'long': rng.uniform(360, 720)}[v.kind]
-        v.exit = rng.choices(['polite', 'vanish'], [7, 3])[0]
+        v.rendition = dr.pick('rendition_u', v.slot['renditions'], v.slot['r_weights'])
+        v.kind = dr.choice('kind', ['zapper', 'medium', 'long'], [2, 6, 2])
+        v.life = dr.uniform('life_s', *{'zapper': (15, 40), 'medium': (60, 240), 'long': (360, 720)}[v.kind])
+        v.exit = dr.choice('exit', ['polite', 'vanish'], [7, 3])
         v.outage = None
-        if v.cls in ('wifi', 'mobile_4g', 'terrible') and rng.random() < 0.3:
-            v.outage = (rng.uniform(0.2, 0.8) * v.life, rng.uniform(2, 8))
+        if v.cls in ('wifi', 'mobile_4g', 'terrible') and dr.random('outage') < 0.3:
+            v.outage = (dr.uniform('outage_at', 0.2, 0.8) * v.life, dr.uniform('outage_s', 2, 8))
         d = run.out / 'desktop' / v.id
         d.mkdir(parents=True, exist_ok=True)
         rec = dict(v.desc(), browser=self.name, endpoint=self.endpoint)
@@ -655,7 +731,7 @@ class DesktopViewer:
             if style == 'vanish':
                 await run.relay_cmd(cmd='blackhole', id=v.id)
                 run.vanished.append((now_s(), v.slot['app'], v.slot['stream'], v.id))
-                await asyncio.sleep(rng.uniform(2, 20))
+                await asyncio.sleep(dr.uniform('vanish_s', 2, 20))
             run.signal(p, signal.SIGTERM)
             # The oracle closes its own context within 15 s of SIGTERM; reap's SIGKILL after 30 s is the last
             # resort, which may leave its window open on the desktop and, in Firefox, the one remote session taken
@@ -668,14 +744,33 @@ class DesktopViewer:
             await run.relay_cmd(cmd='trace_stop', id=v.id)
             await run.relay_cmd(cmd='forget', id=v.id)
         rec['secs'] = round(now_s() - t0, 1)
+        rec['decoded'], rec['presented'] = desktop_counts(d)
         try:
             rec['judged'] = await asyncio.to_thread(judge_desktop, d)
         except Exception as e:  # a judging bug must not end the soak; it shows in the report
             rec['judged'] = dict(ok=False, error=f'judge: {e!r}')
-        (d / 'trace.csv').unlink(missing_ok=True)  # large; the judged numbers are kept
+        if not run.args.keep_trace:
+            (d / 'trace.csv').unlink(missing_ok=True)  # large; the judged numbers are kept
         run.desktop.write(json.dumps(rec) + '\n')
         run.desktop_sessions.append(rec)
         return rec
+
+
+def desktop_counts(d):
+    """Frames the browser decoded (its last stats sample) and frames it painted (presented.jsonl lines)."""
+    decoded = 0
+    try:
+        with open(d / 'stats.jsonl', 'rb') as f:
+            for line in f:
+                decoded = (json.loads(line).get('video') or {}).get('framesDecoded') or decoded
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(d / 'presented.jsonl', 'rb') as f:
+            presented = sum(1 for _ in f)
+    except OSError:
+        presented = 0
+    return decoded, presented
 
 
 def judge_desktop(d):
@@ -720,13 +815,15 @@ class Watch:
 
 async def viewer_arrivals(run):
     a = run.args
-    rng = run.rng
     mean_life = 0.6 * 17.5 + 0.3 * 180 + 0.1 * 1200
     interval = mean_life / a.viewers
     tasks = set()
     ncpu = os.cpu_count() or 4
     while not run.stop.is_set() and not run.quiet.is_set():
-        await wait_any(run, rng.expovariate(1 / interval))
+        run.arrival_n += 1
+        # Numbered before the skips below, so a skipped arrival does not shift the ones after it
+        k = run.arrival_n
+        await wait_any(run, run.plan.actor('arrival', k).expovariate('gap_s', 1 / interval))
         if run.stop.is_set() or run.quiet.is_set():
             break
         if len(run.viewers) >= a.max_viewers:
@@ -734,7 +831,7 @@ async def viewer_arrivals(run):
         if os.getloadavg()[0] > ncpu * 0.9:
             run.event('arrival_skipped_load', load=os.getloadavg()[0])
             continue
-        v = Viewer(run)
+        v = Viewer(run, run.plan.actor('viewer', k), f'v{k}')
         t = asyncio.ensure_future(v.live())
         tasks.add(t)
         t.add_done_callback(tasks.discard)
@@ -929,6 +1026,8 @@ async def quiesce(run, label):
 
 
 def start_traffic(run):
+    # Traffic phase (warm-up, then the measured run): in the plan keys, as publishers and desktops start over
+    run.phase = getattr(run, 'phase', 0) + 1
     run.pubs = {s['id']: Publisher(run, s) for s in SLOTS if not (s['app'] == 'livegpu' and run.args.no_gpu)}
     run.pub_tasks = [asyncio.ensure_future(p.life()) for p in run.pubs.values()]
     for t in run.pub_tasks:
@@ -961,7 +1060,8 @@ async def main_async(args):
         keyframes(s['src'])
     run = Run(args)
     run.reported = set()
-    print(f'traffic sim seed={args.seed} duration={args.duration_s}s viewers~{args.viewers} gpu={not args.no_gpu} out={run.out}',
+    plan_note = f' plan={args.plan} ({"replay" if run.plan.path and run.plan.path.exists() else "new"}, seed {run.plan.seed})' if args.plan else ''
+    print(f'traffic sim seed={run.plan.seed}{plan_note} duration={args.duration_s}s viewers~{args.viewers} gpu={not args.no_gpu} out={run.out}',
           flush=True)
     (ROOT / 'logs').mkdir(exist_ok=True)
     ome_log = ROOT / 'logs' / 'ovenmediaengine.log'
@@ -978,7 +1078,7 @@ async def main_async(args):
     os.chdir(conf)  # Logger.xml's ../logs is relative to the working directory
     run.ome = await run.spawn('ome', args.bin, '-c', conf, log=run.out / 'ome_stdout.log', nice=args.ome_nice)
     run.relay = await run.spawn('relay', sys.executable, '-u', ROOT / 'sim_relay.py', '--classes', ROOT / 'classes.json',
-                                '--control', control, '--seed', args.seed, log=run.out / 'relay.log', nice=args.ome_nice)
+                                '--control', control, '--seed', run.plan.seed, log=run.out / 'relay.log', nice=args.ome_nice)
     try:
         for _ in range(60):
             await asyncio.sleep(0.5)
@@ -1025,7 +1125,10 @@ def make_conf(args):
     opts = ''.join(f'<{k}>{v}</{k}>' for k, v in (('PacketSilenceTimeoutMs', args.rtmp_silence_ms),
                                                    ('FirstMediaWaitTimeoutMs', args.rtmp_first_media_ms)) if v is not None)
     if opts:
-        xml = re.sub(r'(<Providers>\s*)<RTMP(?: />|>.*?</RTMP>)', rf'\1<RTMP>{opts}</RTMP>', xml, flags=re.S)
+        # Applications' providers only: <Bind><Providers><RTMP> takes a port, and these options are refused there
+        xml = re.sub(r'<Application>.*?</Application>',
+                     lambda m: re.sub(r'(<Providers>\s*)<RTMP(?: />|>.*?</RTMP>)', rf'\1<RTMP>{opts}</RTMP>', m.group(0), flags=re.S),
+                     xml, flags=re.S)
         print(f'conf override: RTMP {opts} in {xml.count(opts)} app(s)')
     if args.playout_delay is not None:
         lo, hi = args.playout_delay.split(':')
@@ -1102,6 +1205,9 @@ def report(run, idle, warm, final, log_offset, dumps_before):
     fails = sum(1 for l in lines if l.startswith('FAIL'))
     verdict = (f'TRAFFIC SIM ABORTED ({run.aborted})' if run.aborted and run.aborted != 'OME died' else
                'TRAFFIC SIM PASS' if fails == 0 else f'TRAFFIC SIM FAIL: {fails} check(s)')
+    run.plan.save()
+    lines.append(f"INFO  plan: {run.plan.replayed} decision(s) replayed, {run.plan.added} new (seed {run.plan.seed}); "
+                 f"replay with --plan {run.out / 'plan.json'}")
     lines.append('')
     lines.append(f'{verdict} ({run.out})')
     text = '\n'.join(lines)
@@ -1149,7 +1255,11 @@ def desktop_report(run):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--duration-s', type=float, default=1800)
-    ap.add_argument('--seed', type=int, default=1)
+    ap.add_argument('--seed', type=int, default=1, help="seeds the decisions a plan lacks and the relay's per-packet draws")
+    ap.add_argument('--plan', metavar='FILE',
+                    help='replay the schedule in this plan (JSON; any run writes its own to <out>/plan.json); decisions it '
+                         'lacks are generated from the seed and added. A/B: run both builds with the same --plan')
+    ap.add_argument('--keep-trace', action='store_true', help="keep the desktop sessions' relay traces (desktop/<id>/trace.csv)")
     ap.add_argument('--viewers', type=float, default=12, help='target mean concurrent viewers')
     ap.add_argument('--max-viewers', type=int, default=24)
     ap.add_argument('--warmup-s', type=float, default=300, help='traffic before the warm baseline quiesce')

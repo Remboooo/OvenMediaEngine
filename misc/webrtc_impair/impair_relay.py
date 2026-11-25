@@ -33,7 +33,9 @@ Usage:
 """
 import argparse
 import asyncio
+import hashlib
 import json
+import math
 import os
 import random
 import socket
@@ -94,8 +96,62 @@ def trace(direction, data, delays):
     TRACE.write(f"{time.time():.6f} {direction} {ssrc} {pt} {seq} {ts} {len(data)} {0 if delays else 1}\n")
 
 
+class NamedDraws:
+    """Random numbers named by what they decide instead of drawn from one stream in call order.
+
+    A packet's draws are a hash of (key, packet stream, its index in that stream, purpose): the k-th video packet
+    of a flow gets the same fate in every run with the same key, whatever the other flows, the other packet
+    streams of this flow (RTX, RTCP) or a change to the order or number of draws in Shaper do. The key carries the
+    seed and the flow's name (sim_relay: seed, client tag, direction)."""
+
+    def __init__(self, key):
+        self.key, self.counts = key, {}
+        # Burst (Gilbert) state per packet stream: stepping it on every packet of any stream would let a build's
+        # RTX or RTCP count move the media's bursts
+        self.bad = {}
+
+    def packet(self, stream):
+        n = self.counts.get(stream, 0)
+        self.counts[stream] = n + 1
+        return PacketDraws(f'{self.key}:{stream}:{n}')
+
+
+class PacketDraws:
+    __slots__ = ('prefix',)
+
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+    def random(self, purpose):
+        h = hashlib.blake2b(f'{self.prefix}:{purpose}'.encode(), digest_size=8).digest()
+        return (int.from_bytes(h, 'big') >> 11) * (1.0 / (1 << 53))
+
+    def gauss(self, purpose, sigma):
+        # Box-Muller from two named uniforms
+        u1 = max(self.random(purpose + '.1'), 1e-300)
+        return sigma * math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * self.random(purpose + '.2'))
+
+
+class StreamDraws:
+    """random.Random behind the PacketDraws interface: draws in call order, as before (impair_relay's flows)."""
+    __slots__ = ('rng',)
+
+    def __init__(self, rng):
+        self.rng = rng
+
+    def random(self, purpose):
+        return self.rng.random()
+
+    def gauss(self, purpose, sigma):
+        return self.rng.gauss(0, sigma)
+
+
+def draws_for(rng, stream):
+    return rng.packet(stream) if isinstance(rng, NamedDraws) else StreamDraws(rng)
+
+
 class Shaper:
-    """Decides drop/delay for one direction of one flow."""
+    """Decides drop/delay for one direction of one flow. rng: random.Random, or NamedDraws for per-packet draws."""
 
     def __init__(self, rng, started):
         self.rng, self.started = rng, started
@@ -104,30 +160,43 @@ class Shaper:
         self.last_due = 0.0
         self.stats = dict(pkts=0, bytes=0, dropped=0, queue_drop=0, dup=0, reordered=0, stalled=0)
 
-    def plan(self, cfg, size, now):
-        """Returns a list of send delays in seconds (empty = drop)."""
+    def plan(self, cfg, size, now, stream='all'):
+        """Returns a list of send delays in seconds (empty = drop). stream: the packet stream it belongs to, which
+        numbers it for NamedDraws (e.g. 'rtp120', 'rtcp')."""
+        draw = draws_for(self.rng, stream)
+        named = isinstance(self.rng, NamedDraws)
         self.stats['pkts'] += 1
         self.stats['bytes'] += size
-        if now - self.started < cfg.get('start_after_s', 0):
+        starting = now - self.started < cfg.get('start_after_s', 0)
+        if starting and not named:
             return [0.0]
         burst = cfg.get('burst')
         if burst:
-            if self.bad:
-                self.bad = self.rng.random() >= burst.get('p_exit', 0.3)
+            # Named draws: the state is stepped from the first packet on, also inside start_after_s, so where
+            # the bursts fall depends on packet indexes only, not on how many packets that time window held
+            bad = self.rng.bad.get(stream, False) if named else self.bad
+            if bad:
+                bad = draw.random('burst_exit') >= burst.get('p_exit', 0.3)
             else:
-                self.bad = self.rng.random() < burst.get('p_enter', 0.0)
-            if self.bad and self.rng.random() < burst.get('loss', 1.0):
+                bad = draw.random('burst_enter') < burst.get('p_enter', 0.0)
+            if named:
+                self.rng.bad[stream] = bad
+            else:
+                self.bad = bad
+            if bad and not starting and draw.random('burst_loss') < burst.get('loss', 1.0):
                 self.stats['dropped'] += 1
                 return []
-        if self.rng.random() < cfg.get('loss', 0.0):
+        if starting:
+            return [0.0]
+        if draw.random('loss') < cfg.get('loss', 0.0):
             self.stats['dropped'] += 1
             return []
 
         delay = cfg.get('delay_ms', 0) / 1000
         jitter = cfg.get('jitter_ms', 0) / 1000
         if jitter:
-            delay = max(0.0, delay + self.rng.gauss(0, jitter))
-        reorder = self.rng.random() < cfg.get('reorder', 0.0)
+            delay = max(0.0, delay + draw.gauss('jitter', jitter))
+        reorder = draw.random('reorder') < cfg.get('reorder', 0.0)
         if reorder:
             delay += cfg.get('reorder_ms', 20) / 1000
             self.stats['reordered'] += 1
@@ -162,7 +231,7 @@ class Shaper:
         if not reorder:
             self.last_due = max(self.last_due, now + delay)
         out = [delay]
-        if self.rng.random() < cfg.get('duplicate', 0.0):
+        if draw.random('duplicate') < cfg.get('duplicate', 0.0):
             out.append(delay + 0.001)
             self.stats['dup'] += 1
         return out

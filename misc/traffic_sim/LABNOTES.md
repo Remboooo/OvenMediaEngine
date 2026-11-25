@@ -47,6 +47,7 @@ deploying is skipped for now (user).
 | Smoke-test bar (fixed 97% on a non-decoding probe) | DONE ea1c9fe40: decoding viewers on desktop A + per-profile baseline | 2026-10-24 |
 | Patched build passes source arrival jitter to viewers (+33–36 ms clean, up to ~100 ms impaired, vs upstream; more freezing at 240 ms jitter) | DONE bb2f1b7c1 (capped release; deployed 16:40, prod smoke PASS 17:57): delay −30–55 ms, send p99 125 → 72 ms. Early-side jitter: early anchor tried; no regression and no viewer-visible gain (2026-10-25), kept as a patch. 240 ms step unchanged | 2026-10-24 |
 | Decode check on B-frame streams (s1080) flags late-completed frames | OPEN: d636baefa decodes in arrival order; a frame completed late keeps its place ("reference picture missing during reorder", ~10/step under reorder or loss). Needs decode order from slice headers (frame_num, nal_ref_idc). Viewer metrics unaffected | 2026-10-24 |
+| Rebase onto upstream master (af0f55cc4): do the upstream fixes that replaced ours (NACK, ULPFEC generator, LL-HLS session leak, monitoring drift) serve as well? | CHASING: A/B fork vs rebased | 2026-11-24 |
 
 ## 2026-10-22
 
@@ -460,3 +461,176 @@ Smoke ×5 vs capped ×5 (`cmp_early_r*`, `cmp_capped_r*`; capped r5 rerun in the
   its ULPFEC receiver). Removed from the SDP offer and the packets; OvenRtcTester now finds keyframes in the H.264
   payload. Harness smoke PASS on all 6 profiles (`webrtc_impair/logs/smoke_20261029_233236`, headless viewers only:
   the desktop browsers were not reachable). **DONE.**
+
+
+## 2026-11-24
+
+- Rebased the fork (24 commits) onto upstream master af0f55cc4, branch `rebase/onto-upstream-2026-11`. Dropped as
+  redundant: our NACK fix (upstream #2382), LL-HLS keep-alive session leak (#2376/#2377). Upstream won: ULPFEC
+  generator (#2409: extension protection, 48-packet blocks, per-viewer SN shift). Kept/ported: `UlpfecEncodeWorker`
+  (Encode off the packetize thread) now feeds frame copies to upstream's generator; `RemapFecSnBase` on send,
+  upstream's `ShiftSequenceNumberBase` on RTX; monitoring keeps our once-only release plus upstream's check.
+  Dependencies for the rebased build in a separate prefix (upstream now needs dav1d), never the deployed one.
+  Plan: `webrtc_impair/compare_builds.sh` with `CMP_BUILDS="fork rebased"` (smoke, then limits), then a traffic
+  sim soak per build with the same seed. **CHASING.**
+- Rebased build: 1452/1452 unit tests after fixes (880dd6366 on the rebase branch). Two upstream tests adapted to the
+  fork's design (no framemarking on FEC; RTX goes out on the session send thread, so the NACK test drains it).
+  The FEC packet test depends on the Encode worker finishing within kFecEmitWait (3 ms): fine 5/5, may flake under load.
+- Smoke A/B rep 1 (`webrtc_impair/logs/cmp_fork_r1`, `cmp_rebased_r1`, `compare_builds.sh` with `CMP_BUILDS="fork
+  rebased"`, desktop A browsers, OME_IMPAIR_NICE=19). Fork r1 lost ICE for every viewer from `stalls` on (no UDP
+  through the relay after 01:10, server log clean); rebased r1 ran the same profiles fine. Not reproduced yet; rerun.
+  Rebased: same decode/correctness; loss_1pct Chrome one 1.07 s freeze, 81% shown, 6 PLIs (fork 0, 99.6%);
+  impaired-profile e2e p50 +25-45 ms with higher Chrome jitter buffer (jitter_reorder 98 vs 59 ms); clean equal.
+  RTX packets on loss_1pct 3644 vs 2236 for the same NACK count.
+  - DEAD END: upstream's generator sending more parity. Packets per frame on the clean profile 106.68 vs 106.44,
+    same bytes (scratchpad fecshare.py over relay_trace.txt).
+  - Pacer AdaptiveDelay stepped up once more on rebased (80 -> 111 ms, source lateness p99 91 vs 74 ms). Server-side
+    hold, not in e2e. Send-offset spread per frame at the relay about equal (p95 within a few ms), some fatter
+    p99 tails on rebased. Waiting for reps 2-3 before chasing.
+- Smoke A/B done, 3 reps (`cmp_fork_r1..3`, `cmp_rebased_r1..3`; scratchpad smoke_ab.py tabulates). Decode checks
+  pass on every run of both builds; freezes, drops and probe delivery comparable (rebased better on jitter_reorder:
+  97.1/95.6/97.2% vs 95.9/93.6/89.4%). Fork r1's ICE loss did not recur (r2, r3 fine): one-off.
+  Delay: rep 3 is worse for both builds (drift: desktop or host); rebased r3 ran last and is worst even on clean
+  (Chrome 130 ms vs 92-102). Reps 1-2 still show rebased higher on jitter_reorder Chrome (~150 vs ~112 ms, jitter
+  buffer ~94 vs ~59 ms). loss_1pct rebased r1 (163 ms, 6 PLIs) was desktop A's decoder falling to ~45 fps mid-run
+  while the network kept delivering; r2 75 ms matches the fork.
+  - DEAD END: extra RTX for the same NACKs. Over a whole run, RTX full/padding packet counts equal (49k/135k both).
+  - Adaptive playout delay raises only above a 100 ms base RTT; jitter_reorder's path is ~40 ms. To be checked.
+  Next: interleaved experiment clean/loss_1pct/jitter_reorder x4 per build (`cmp_jfork_r*`, `cmp_jrebased_r*`) with
+  `WebRTC Publisher` at debug (playout-delay decisions), Logger.xml restored after.
+
+## 2026-11-25
+
+- Interleaved experiment done (`webrtc_impair/logs/cmp_jfork_r1..4`, `cmp_jrebased_r1..4`, clean/loss_1pct/
+  jitter_reorder, `WebRTC Publisher` at debug; Logger.xml restored). Host load 4.6-5.8 on 4 cores throughout
+  (another tenant's transcoder at ~95% CPU), so absolute delays sit above earlier runs for both builds.
+  - DEAD END: adaptive playout delay. It raised only once, in fork r1 (NACK storm); never on rebased. Not the
+    jitter-buffer gap.
+  - jitter_reorder now equal: e2e p50 Chrome 268 vs 266 ms, p95 rebased better (584 vs 896). Jitter buffer still
+    reads higher on rebased (179 vs 148 ms Chrome, 201 vs 158 Firefox); Firefox freezes 5.5 vs 3.2.
+  - **REAL REGRESSION, loss_1pct**: Chrome on desktop A switches from hardware to software H.264 decode mid-run
+    (getStats totalDecodeTime per frame 0.6 ms -> ~21 ms, decode capped ~45 fps of 60, framesDropped climbing,
+    jitter buffer growing) on rebased r1, r2, r3, never on the fork r1-4. Earlier smoke rebased r1 was the same
+    (misread as the desktop). Each fallback follows a 1-2 s hole: packets keep arriving, framesReceived stops,
+    PLIs fire, decode resumes in software. Not resolution (4K bypass throughout); an error-triggered fallback.
+    Something under loss hands Chrome a bad or unassemblable frame. Chrome does not expose
+    decoderImplementation or video FEC counters to this page.
+  - The send-side diff fork -> rebased is small (rtc_session 12 lines: upstream's ShiftSequenceNumberBase on RTX;
+    packetizer: frame copies of the raw packet to the worker, FEC packets now carry the header extensions).
+    The upstream generator test already rebuilds lost packets end to end through the packetizer.
+  Next: loss_1pct x5, interleaved fork / rebased / rebased with `OME_WEBRTC_DISABLE_ULPFEC=1`
+  (`cmp_lfork_r*`, `cmp_lrebased_r*`, `cmp_lnofec_r*`) to split FEC from the rest.
+- loss_1pct x5 interleaved (`webrtc_impair/logs/cmp_lfork_r1..5`, `cmp_lrebased_r1..5`, `cmp_lnofec_r1..5`,
+  out `cmp_loss_exp.out`): the decoder fallback **flipped sides**. Sustained software decode on fork r3, r5 (r1
+  in bursts), on no rebased rep, on no no-FEC rep. Rebased beat the fork on every column this round (Chrome shown
+  98.7 vs 84.3%, PLIs 0 vs 7, e2e p50 129 vs 161 ms; probe 97.9 vs 96.3%; fork r1 and r5 failed the probe check).
+  - DEAD END: "rebased makes Chrome fall back to software decode". Over both experiments rebased 3/9, fork 2-3/9:
+    it is desktop A's Chrome under a loaded host and a 4K60 stream with holes, independent of the build. Watch for
+    it when reading Chrome numbers: a per-frame totalDecodeTime above ~10 ms marks a fallback rep.
+  Next: traffic sim soak A/B (same seed, both desktops).
+- Soak A/B (9000 s, seed 21, `--playout-delay 50:200 --adaptive-playout`, both desktops, OME nice 19; fork
+  04:35-07:05 then rebased 07:06-09:36, host load 2.9 / 3.0): `logs/rb_soak_fork`, `logs/rb_soak_rebased`.
+  Fork FAIL on leaks (RSS 273 -> 390 MB, heap 130 -> 298); rebased PASS on every check (RSS 184 -> 206, idle
+  baseline 149 vs 239 MB: the rebased binary links its own dependency prefix, allocator included).
+  Reading the desktop table needs care: the seed fixes the schedule, not which desktop viewer lands where.
+  - s1080 (B-frames) Chrome lockups land on whichever build draws them: rebased deskA-chrome_48 alone had 154
+    freezes, 757 PLIs. Excluded.
+  - s720 1.3-1.5 s freezes every 45.0 s on every viewer at once, fiber with zero loss included: the
+    `uplink_stalls` publisher class (1.5 s every 45 s, by design). Rebased drew it on s720 for 6 sessions full of
+    viewers, the fork for 2 short ones with 2 viewers (which froze the same way). Excluded.
+  - What remains (scratchpad soak_ab.py; fiber/residential/wifi, no s1080, no designed stalls): frozen 1.08% vs
+    0.99%, but freezes >= 0.9 s 8.1/h vs 4.8/h, Chrome e2e p50 +11..26 ms. The excess is on gpu4k `auto`:
+    half of those long freezes sit at a rendition switch (both builds), and rebased switches more often in every
+    class (residential Chrome 7.9 vs 6.4/min, Firefox 7.7 vs 6.0; fiber 0.5 vs 0.3, 1.9 vs 0.9).
+  - Suspect: upstream #2409 gives ULPFEC packets the header extensions, so parity now takes transport-wide
+    numbers and lost parity counts as loss in the estimator that drives ABR (fork parity had no extensions).
+    Test: `limits.py --stream gpu4k --playlist abr --rendition auto --quick --dims loss,burst,rate`, Chrome
+    desktop A, fork / rebased / rebased-noext (rebased with `fec_header->SetExtensions` removed,
+    built into its own prefix), 2 interleaved reps: `logs/rbabr_<build>_r<N>`, judged by abr_settle.py.
+- Harness fixes (traffic_sim.py, limits.py): limits.py crashed in `make_conf` (Namespace without
+  playout_delay/no_switches since the pre-release test added them); and `make_conf` put the RTMP timeout options
+  into `<Bind><Providers><RTMP>` too, which OME refuses ("Unknown item found"). Now applications only.
+- ABR A/B/C done (`logs/rbabr_*`): switches per run fork 40/30, rebased 40/44, rebased-noext 52/44.
+  - DEAD END: parity's transport-wide numbers. Without the extensions it switches as much or more. Parity is also
+    the same on the wire (`logs/rbpar_*`, traced loss=2%: 21.6 vs 21.2 vs 20.5% of video bytes, every frame,
+    0.1 ms after its marker packet; p99 11 vs 16 vs 17 ms). RtcBandwidthEstimator is byte-identical in both trees.
+  - The only per-dimension difference was loss=0.5% (fork 0/0 switches, rebased 4/4). A rerun of that step alone
+    with the estimator at debug (`logs/rbl05_*`) turned it round: fork 0 then 6, rebased 0 and 0. Noise: one lost
+    packet in a 9-packet frame reads as 11% loss, so OverUse at 0.5% random loss depends on where the losses fall.
+    (Note: the fork r1 rerun had OverUse decisions on the probe session while the desktop stayed at 1080p; the
+    estimator log line names the estimator, not the session.)
+  - The soak difference itself, per session (permutation test, gpu4k auto): residential fork 5.6 vs rebased
+    7.1 switches/min (n 16/21, p=0.01), wifi 4.8 vs 6.0 (p=0.17), fiber 0.5 vs 1.2 (p=0.12). Residential is not
+    rate-limited (0.3% loss, 15+-8 ms jitter, 0.5% reorder, 200 ms stall every 40 s), so the next test is the
+    delay side: `logs/rbjit_<build>_<dim>_r<N>`, jitter 5,15 / reorder 25 / hold 250, 3 interleaved reps.
+  - Both builds flap 5-7 times a minute on residential and wifi. That is the estimator, before and after the
+    rebase, and worth its own fix later.
+- Delay-side ABR A/B (`logs/rbjit_*`, 3 interleaved reps): switches fork 12, rebased 6 in total (jitter 5/15 ms:
+  6 vs 2, reorder 25 ms: 6 vs 4, hold 250 ms: 0 vs 0). Freezes, recovery and e2e the same row for row. No
+  controlled test (loss, burst, rate, jitter, reorder, hold) shows rebased switching more. The other send-path
+  diffs are not on the media path (ICE: STUN only; rtp_rtcp: ingest jitter buffer; SR generator: counts).
+  Next: the soak again, interleaved so time of day and host load fall on both builds: 4 x 3600 s, seed 21,
+  rebased / fork / rebased / fork (`logs/rbs2_<build>_leg<N>`), hostload logger restarted.
+- Harness: the soak's A/B was not like for like. The seed fixed only the start: traffic_sim drew every actor's
+  decisions from one stream in call order, and desktop sessions draw when the previous one ends, so the two
+  runs parted ways within minutes (overnight: rebased drew 21 residential gpu4k/auto desktop sessions, the
+  fork 16). The relay drew per-packet fates from one stream across all clients in arrival order, so one viewer's
+  losses depended on everyone's traffic. Also, viewer arrivals skipped under host load shifted the rest.
+  Fixed (user's suggestion: a plan file, not just a seed, so changes to the generator code cannot reshuffle it):
+  `--plan FILE` replays named decisions (traffic_sim `Plan`; every run writes `<out>/plan.json`); the relay
+  names each packet's draws by hash (impair_relay `NamedDraws`, keyed by seed, client tag, direction, RTP payload
+  type / kind, index). Offline checks: draw order does not matter, replay exact, interleaved RTX does not shift
+  media fates, loss and jitter statistics right. smoke_test's relay keeps its old draw order.
+  The interleaved soak `logs/rbs2_*` (4 x 3600 s) ran on the old harness: read it with that in mind.
+- Interleaved soak (old harness; `logs/rbs2_*`, rebased / fork / rebased / fork, 1 h each, 12:20-16:24, scratchpad
+  soak_pool.py; no s1080, no designed stalls): fork vs rebased frozen 1.00 vs 0.83%, freezes 72 vs 53/h,
+  >= 0.9 s 5.2 vs 4.0/h; gpu4k auto switches residential 6.30 vs 6.29/min (p=0.99), all 2.9 vs 3.1 (p=0.79).
+  The overnight residential switching gap was the schedule, not the build. Chrome e2e p50 again higher on
+  rebased (fiber 102 vs 78 ms) but per session it is bimodal: 50-100 ms, or 150-210 where Chrome's target has
+  climbed to the 200 ms playout cap; high-mode sessions fork 7/28, rebased 8/22, median jitter buffer 67 vs 62.
+  Session mix again. One rebased E/C line ("cannot find ApplicationWorker for stream mapping") and one 8 s
+  freeze on s720 Bypass (one frame unassemblable, PLIs every 200 ms, Bypass cannot answer a PLI, waits for the
+  8 s GOP): known limitation, both builds.
+  The E/C line is a teardown race in code both trees share: s720 unpublished neatly, the stream was unmapped,
+  then the transcoder flushed its last frame ("1 frames left in the queue on closing") into the WebRTC
+  publisher's OnSendFrame. One dropped frame of a stream already gone; once in ~7 h. Parked.
+- Plan replay check 1 (`rbdet_a`/`_b`, rebased twice, 600 s, one plan): publisher cycles and viewer arrivals
+  identical; desktops made the same sessions in the same order (same streams, durations within 1 s, the same
+  outage / freeze_reload / oracle_exit on the same session). Found and fixed: (1) a relative --plan path broke
+  the final save (OME's cwd is conf/); (2) publishers and desktops start over in the measured phase after the
+  warm-up quiesce, so the plan keys now carry the phase; (3) older: desktop session ids restarted per phase, so
+  the measured phase's `deskA-chrome_1` overwrote the warm-up's `desktop/deskA-chrome_1/` files (stats.jsonl;
+  desktop.jsonl's judged numbers were fine) and reused its relay tag. Now 101.. in phase 2. traffic_sim gained
+  --keep-trace (desktop traces) for the per-packet check: check 2 is running.
+- Plan replay check 2 (traces kept): independent loss lands on the same packets (e.g. 269 of 270), bursts did
+  not: the Gilbert burst state stepped on every packet of any stream, so a run's RTX/RTCP count moved the
+  media's bursts, and the start_after_s window (time-based) changed where the state machine started. Now the
+  state is kept per packet stream with the named draws and stepped from the first packet (offline: identical
+  media fates with different RTX volumes and startup counts; impair_relay's random.Random path unchanged).
+  Rate-limited classes (mobile_4g, terrible) still differ: a bottleneck queue's drops depend on timing, as they
+  should. Check 3 running.
+- Plan replay check 3 (`rbdet_a`/`_b`): every residential, wifi and fiber desktop session lost exactly the same
+  video packets in both runs (285/285, 395/395, 728/728, 544/544, ...); rate-limited sessions differ (queue,
+  by design). Publisher cycles identical; desktop sessions identical but for the last one or two per desktop
+  (the run ends mid-session at a slightly different point). Background arrivals: same draws, but which ones join
+  still depends on the load and max-viewers skips.
+- A/B soak with shared plans (`logs/rbs3_<build>_p<seed>`, plans `logs/plan_rbs3_41.json`, `_42.json`), ABBA:
+  rebased p41, fork p41, fork p42, rebased p42, 1 h each, 17:36-21:40. All four PASS (no crash, no leaks).
+  Plan 41: 132 of 135 desktop sessions identical in both legs. Plan 42: the rebased leg made 211 desktop
+  sessions against 117, because of a desktop event: at 20:56 deskB stopped painting (Chrome and Firefox both:
+  getStats kept decoding at ~24 fps, rVFC / presented.jsonl stopped). Chrome came back on its next session;
+  Firefox stayed wedged for the rest of the hour (every session decoded, presented 1 frame, ended after ~16 s
+  as frozen). Not the server: it kept delivering frames that decoded. Fixed in traffic_sim: a session that
+  decoded > 60 frames but painted < 5 now counts toward the 3-strikes browser restart, and desktop.jsonl
+  records `decoded` / `presented` per session. (Also, the scratchpad soak_pool.py took window_s = -4 (no
+  picture) as truthy; now skipped.)
+  Paired by session id (scratchpad paired.py, sign-flip permutation on the per-session rate difference,
+  fork vs rebased; no s1080, no terrible / mobile_4g, the stalled deskB sessions excluded; 141 pairs, 248 min
+  each): freezes 68.8 vs 68.7/h (p=0.92), frozen 36.6 vs 32.7 s/h (p=0.80), >= 0.9 s 8.0 vs 5.8/h (p=0.97),
+  auto switches 131 vs 135/h (p=0.70), join median diff 0.00 s; e2e p50 +2 ms median on rebased (p=0.16; with
+  s1080 and terrible/4g in, +3 ms, p=0.007; s1080 auto alone +8). Both trees have the FEC encode worker.
+  Rebased p42 rerun (`logs/rbs3_rebased_p42b`, 21:42-22:43, deskB Firefox restarted first): PASS, 116 of 117
+  desktop sessions identical to the fork p42 leg, no browser restarts. Paired over p41 + p42/p42b (160 pairs,
+  ~272 min each, same exclusions): freezes 67.4 vs 64.9/h (p=0.88), frozen 35.9 vs 29.4 s/h (p=0.49),
+  >= 0.9 s 8.4 vs 4.4/h (p=0.044, rebased better), switches 131 vs 139/h (p=0.24), join same; e2e p50 +3 ms
+  median on rebased (p=0.015). Verdict: rebased at least as good; a few ms of e2e accepted.

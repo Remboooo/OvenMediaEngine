@@ -7,6 +7,7 @@ Imitates an evening of normal use on an imperfect network with imperfect clients
 ./traffic_sim.py --duration-s 300 -v      # quick, printing every event
 ./traffic_sim.py --duration-s 28800       # overnight soak
 ./traffic_sim.py --seed 7 --no-gpu        # another schedule, Bypass-only
+./traffic_sim.py --plan logs/A/plan.json  # replay run A's schedule (A/B: the same --plan for both builds)
 ```
 
 Part of the [pre-release real-world test](../README.md), which says when to run it and how to read the results. Setup: `make_sources.sh` makes the three publisher sources; the LAN address that desktop browsers reach is detected from the default route (`OME_TEST_LAN_IP` overrides it).
@@ -104,7 +105,7 @@ Publishers always start on a keyframe of their source. Otherwise `ffmpeg -ss -c 
 
 - **Find the moment:** `grep FAIL logs/sim_*/events.jsonl` gives the time `t`. Then look at the events around it: which publisher stopped, and how, and which viewers joined or left.
 - **Trace sessions:** `conf/Logger.xml` sets the `Monitor` tag to info. The OME log then has a line for every session start and stop ("A new session has started playing …" / "A session has been stopped playing …"), with per-stream and app totals. A count that never returns to 0 can be matched to the session that never stopped.
-- **Reproduce:** the same `--seed` replays the same schedule of choices. Timing still varies, so the same race may need a few runs.
+- **Reproduce, and A/B:** every run writes its schedule to `<out>/plan.json`: each random decision by actor and name (publisher slot and cycle: uplink class, live time, stop style; viewer arrival n and desktop session n: network class, rendition, life, exit, outage). `--plan FILE` replays it. A decision the file lacks (a desktop that got through more sessions, a field new to the code) is generated from the seed and that name alone and added to the file. Decisions are not drawn from one stream in call order, because actors draw when timing lets them: two runs of a seed used to part ways within minutes. The relay's per-packet draws are named the same way: a hash of seed, client, direction, packet stream (RTP payload type, RTCP, ...) and index, so a client's k-th video packet meets the same fate in both runs, whatever the other clients or a build's retransmissions do. What still varies: timing, and which live stream a desktop session joins (the plan holds its draw, the live set decides).
 
 # Limits test (`limits.py`)
 

@@ -428,7 +428,7 @@ class Limits:
         self.out.mkdir(parents=True, exist_ok=True)
         self.results = []
         self.failures = []
-        sim_args = argparse.Namespace(seed=args.seed, out=str(self.out / 'sim'), verbose=False)
+        sim_args = argparse.Namespace(seed=args.seed, plan=None, out=str(self.out / 'sim'), verbose=False)
         self.run = ts.Run(sim_args)
         self.pub_proc = None
 
@@ -899,7 +899,9 @@ async def main_async(args):
     run = lim.run
     ome_log = ROOT / 'logs' / 'ovenmediaengine.log'
     lim.log_offset = ome_log.stat().st_size if ome_log.exists() else 0
-    conf = ts.make_conf(argparse.Namespace(rtmp_silence_ms=args.rtmp_silence_ms, rtmp_first_media_ms=None))
+    conf = ts.make_conf(argparse.Namespace(rtmp_silence_ms=args.rtmp_silence_ms, rtmp_first_media_ms=None,
+                                            # limits.py applies its own playout delay and switch settings below
+                                            playout_delay=None, adaptive_playout=False, no_switches=False))
     features = set() if args.webrtc_features == 'none' else set(args.webrtc_features.split(','))
     unknown = features - set(WEBRTC_FEATURES)
     if unknown:
